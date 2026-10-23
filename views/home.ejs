@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title><%= botName %> — Telegram AI Bot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0b0f17;
+    --bg-elevated:#121a2b;
+    --line:#22304a;
+    --text:#eaf0ff;
+    --muted:#8593ad;
+    --strand-a:#34e5b5;
+    --strand-b:#7c6cf6;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    min-height:100vh;
+    background:var(--bg);
+    color:var(--text);
+    font-family:'Inter',sans-serif;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow-x:hidden;
+    position:relative;
+  }
+  .helix{
+    position:fixed;
+    top:50%;
+    right:4vw;
+    transform:translateY(-50%);
+    width:140px;
+    opacity:0.35;
+    animation:drift 10s ease-in-out infinite;
+  }
+  @keyframes drift{
+    0%,100%{ transform:translateY(-50%); }
+    50%{ transform:translateY(-46%); }
+  }
+  @media (max-width:900px){ .helix{ display:none; } }
+  .wrap{
+    max-width:640px;
+    padding:64px 32px;
+    position:relative;
+    z-index:1;
+  }
+  .eyebrow{
+    font-family:'JetBrains Mono',monospace;
+    font-size:13px;
+    letter-spacing:0.08em;
+    color:var(--strand-a);
+    margin:0 0 18px;
+  }
+  h1{
+    font-family:'Space Grotesk',sans-serif;
+    font-weight:700;
+    font-size:clamp(38px,6vw,58px);
+    line-height:1.05;
+    margin:0 0 16px;
+    background:linear-gradient(90deg,var(--text) 40%,var(--strand-a));
+    -webkit-background-clip:text;
+    background-clip:text;
+    -webkit-text-fill-color:transparent;
+  }
+  .sub{
+    color:var(--muted);
+    font-size:17px;
+    line-height:1.6;
+    max-width:480px;
+    margin:0 0 36px;
+  }
+  .cta-row{ display:flex; flex-wrap:wrap; gap:14px; margin-bottom:56px; }
+  .btn{
+    font-family:'Inter',sans-serif;
+    font-weight:600;
+    font-size:15px;
+    text-decoration:none;
+    padding:13px 26px;
+    border-radius:10px;
+    transition:transform 0.15s ease, background 0.2s ease, border-color 0.2s ease;
+    display:inline-block;
+  }
+  .btn:focus-visible{ outline:2px solid var(--strand-a); outline-offset:3px; }
+  .btn-primary{
+    background:linear-gradient(90deg,var(--strand-a),var(--strand-b));
+    color:#08111a;
+  }
+  .btn-primary:hover{ transform:translateY(-2px); }
+  .btn-ghost{
+    background:transparent;
+    color:var(--text);
+    border:1px solid var(--line);
+  }
+  .btn-ghost:hover{ border-color:var(--strand-b); transform:translateY(-2px); }
+  .divider{
+    border:none;
+    height:1px;
+    background:linear-gradient(90deg,var(--strand-a),var(--line) 60%);
+    margin:0 0 28px;
+    max-width:180px;
+  }
+  .links-label{
+    font-family:'JetBrains Mono',monospace;
+    font-size:12px;
+    letter-spacing:0.08em;
+    color:var(--muted);
+    margin:0 0 14px;
+  }
+  .pill-row{ display:flex; gap:10px; flex-wrap:wrap; }
+  .pill{
+    font-size:14px;
+    font-weight:500;
+    color:var(--text);
+    text-decoration:none;
+    padding:9px 18px;
+    border-radius:999px;
+    background:var(--bg-elevated);
+    border:1px solid var(--line);
+    transition:border-color 0.2s ease, color 0.2s ease;
+  }
+  .pill:hover{ border-color:var(--strand-a); color:var(--strand-a); }
+</style>
+</head>
+<body>
+
+  <svg class="helix" viewBox="0 0 140 720" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <path d="M115,0 C115,45 25,45 25,90 C25,135 115,135 115,180 C115,225 25,225 25,270 C25,315 115,315 115,360 C115,405 25,405 25,450 C25,495 115,495 115,540 C115,585 25,585 25,630 C25,675 115,675 115,720" stroke="#34e5b5" stroke-width="3"/>
+    <path d="M25,0 C25,45 115,45 115,90 C115,135 25,135 25,180 C25,225 115,225 115,270 C115,315 25,315 25,360 C25,405 115,405 115,450 C115,495 25,495 25,540 C25,585 115,585 115,630 C115,675 25,675 25,720" stroke="#7c6cf6" stroke-width="3"/>
+    <g stroke="#3a4a6b" stroke-width="2">
+      <line x1="45" y1="45"  x2="95" y2="45"/>
+      <line x1="45" y1="135" x2="95" y2="135"/>
+      <line x1="45" y1="225" x2="95" y2="225"/>
+      <line x1="45" y1="315" x2="95" y2="315"/>
+      <line x1="45" y1="405" x2="95" y2="405"/>
+      <line x1="45" y1="495" x2="95" y2="495"/>
+      <line x1="45" y1="585" x2="95" y2="585"/>
+      <line x1="45" y1="675" x2="95" y2="675"/>
+    </g>
+  </svg>
+
+  <div class="wrap">
+    <p class="eyebrow">// TELEGRAM · AI ASSISTANT</p>
+    <h1>Welcome to <%= botName %></h1>
+    <p class="sub">Two strands, one bot. Chat with the assistant or reach support — both a tap away.</p>
+
+    <div class="cta-row">
+      <a href="<%= botLink %>" class="btn btn-primary" target="_blank" rel="noopener">Start chatting</a>
+      <a href="<%= supportLink %>" class="btn btn-ghost" target="_blank" rel="noopener">Get support</a>
+    </div>
+
+    <hr class="divider">
+    <p class="links-label">READ BEFORE YOU CONNECT</p>
+    <div class="pill-row">
+      <a href="/terms" class="pill">Terms of Service</a>
+      <a href="/privacy" class="pill">Privacy Policy</a>
+    </div>
+  </div>
+
+</body>
+</html>
