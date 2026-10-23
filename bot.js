@@ -1701,14 +1701,14 @@ bot.onText(/^\/admin(?:@\w+)?\s*$/, async (msg) => {
   await safeSend(CFG.ADMIN_ID,
     `🎧 <b>Admin Panel</b>\n${LINE}\n\n` +
     `📣 <b>Messaging</b>\n` +
-    `/broadcast <i>message</i>\n\n` +
+    `/broadcast <i>message to bot users</i>\n\n` +
     `👥 <b>Users</b>\n` +
     `/users — list approved users\n` +
     `/approve <i>id</i> <i>hours</i>\n` +
     `/remove <i>id</i>\n` +
+    `/banned — list banned users\n` +
     `/ban <i>id</i> <i>reason</i>\n` +
-    `/unban <i>id</i>\n` +
-    `/banned — list banned users\n\n` +
+    `/unban <i>id</i>\n\n` +
     `🔐 <b>Access Mode</b>\n` +
     `/private — approved users only\n` +
     `/public — open to everyone\n` +
