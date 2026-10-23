@@ -1,6 +1,6 @@
 # 🤖 AI Assistant Telegram Bot
 
-A powerful, feature-rich Telegram bot acting as your private AI companion. This bot integrates **Google Gemini, OpenAI, and Claude** API to provide intelligent conversations, image generation, web searches, and document analysis.
+A powerful, feature-rich Telegram bot acting as your private AI companion. This bot integrates **Google Gemini, OpenAI, and Claude** API to provide intelligent conversations.
 
 It includes a robust **User Management System** (via MongoDB) to track usage, enforce limits, and manage access (Public/Private modes).
 
@@ -10,8 +10,6 @@ It includes a robust **User Management System** (via MongoDB) to track usage, en
 
 * **🧠 Multi-Model Support:** Switch between Gemini (Flash/Pro), GPT-4o, and Claude 3.
 * **💬 Intelligent Chat:** Context-aware conversations with memory (stores last 10 messages).
-* **🔍 Web Search:** Real-time web search capabilities using Serper API.
-* **🎨 Image Generation:** Create images from text prompts (via Pollinations AI).
 * **👁️ Image Vision:** Send photos to ask questions about them (uses Gemini Vision).
 * **📄 Document Analysis:** Summarize and analyze PDF, DOCX, and TXT files.
 * **🛡️ Admin Controls:**
@@ -43,7 +41,7 @@ Change file named `.env.example` to `.env` and enter all the required api keys.
 
 1.  **Clone the repository:**
 
-        git clone https://github.com/Aman-20/Telegram_bot.git
+        git clone https://github.com/Aman-20/telegram-ai-bot.git
         cd Telegram_bot
 
 2.  **Install dependencies:**
@@ -86,23 +84,24 @@ Once deployed, the bot will automatically set the Webhook to your Render URL.
 | :--- | :--- |
 | `/start` | Initialize the bot. |
 | `/help` | Show the list of available commands. |
-| `/search <query>` | Search the web for information. |
-| `/imagine <prompt>` | Generate an image using AI. |
 | `/setmodel` | Switch between Gemini, GPT, or Claude. |
 | `/account` | Check your daily usage, token limits, and stats. |
 | `/language` | Change the bot's response language. |
 | `/clearchat` | Clear your conversation history memory. |
+| `/status` | Check if you have bot access. |
 
 ### 👮 Admin Commands (Only for `ADMIN_ID`)
 
 | Command | Description |
 | :--- | :--- |
-| `/status` | Check if you are an admin. |
 | `/broadcast <msg>` | Send a message to all bot users. |
 | `/usage` | View a report of today's total usage. |
 | `/users` | List all approved users (in Private Mode). |
 | `/approve <id>` | Grant access to a user for 24 hours. |
 | `/remove <id>` | Revoke a user's access. |
+| `/banned` | List all banned users. |
+| `/ban <id>` | Ban a user form using this bot. |
+| `/unban <id>` | Unban user for using this bot. |
 | `/public` | Open the bot to everyone. |
 | `/private` | Lock the bot (whitelist only). |
 
