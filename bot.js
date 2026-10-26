@@ -7,12 +7,40 @@ import fetch from "node-fetch";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { createRequire } from "module";
+import dns from "node:dns";
+import net from "node:net";
 
 const require = createRequire(import.meta.url);
-const pdf = require("pdf-parse");
 const mammoth = require("mammoth");
 
+// pdf-parse: v1 exports a function (its index.js has a debug-mode bug, so load lib directly);
+// v2 exports a PDFParse class. Support both.
+let _pdfParse = null;
+async function parsePdf(buffer) {
+  if (!_pdfParse) {
+    try { _pdfParse = require("pdf-parse/lib/pdf-parse.js"); }
+    catch { _pdfParse = require("pdf-parse"); }
+  }
+  if (typeof _pdfParse === "function") {
+    const d = await _pdfParse(buffer);
+    return d.text || "";
+  }
+  if (_pdfParse?.PDFParse) {
+    const parser = new _pdfParse.PDFParse({ data: buffer });
+    try { return (await parser.getText()).text || ""; }
+    finally { await parser.destroy?.().catch?.(() => { }); }
+  }
+  throw new Error("PDF_PARSER_UNSUPPORTED");
+}
+
 dotenv.config();
+
+// ============================================================
+//  NETWORK FIX (AggregateError / ETIMEDOUT on Node 20+)
+//  Prefer IPv4 and disable "happy eyeballs" auto family selection
+// ============================================================
+try { dns.setDefaultResultOrder("ipv4first"); } catch { }
+try { net.setDefaultAutoSelectFamily?.(false); } catch { }
 
 // ============================================================
 //  ENV CONFIGURATION
@@ -83,32 +111,54 @@ function validateEnv() {
 }
 validateEnv();
 
-process.on("unhandledRejection", (err) => console.error("⚠️ UnhandledRejection:", err?.message || err));
-process.on("uncaughtException", (err) => console.error("⚠️ UncaughtException:", err?.message || err));
+// Never let the bot token reach logs (node-fetch errors include the full file URL)
+function redact(s) {
+  return CFG.TOKEN ? String(s).split(CFG.TOKEN).join("<token>") : String(s);
+}
+
+function logErr(label, err) {
+  console.error(label, redact(err?.message || err));
+  if (Array.isArray(err?.errors)) {
+    err.errors.forEach((e, i) => console.error(redact(`   ↳ [${i}] ${e?.code || ""} ${e?.address || ""}:${e?.port || ""} ${e?.message || e}`)));
+  }
+}
+
+process.on("unhandledRejection", (err) => logErr("⚠️ UnhandledRejection:", err));
+// State after an uncaught exception is unknown: log, then exit so the host restarts us cleanly
+process.on("uncaughtException", (err) => {
+  logErr("⚠️ UncaughtException:", err);
+  setTimeout(() => process.exit(1), 500);
+});
 
 // ============================================================
 //  MONGODB
 // ============================================================
+// The mongoose driver reconnects on its own after the first successful connect,
+// so we only log here (a manual reconnect would race with the driver).
 mongoose.connection.on("disconnected", () => {
-  console.warn("⚠️ MongoDB disconnected — reconnecting…");
-  setTimeout(connectDB, 3000);
+  console.warn("⚠️ MongoDB disconnected — driver will try to reconnect…");
 });
+mongoose.connection.on("reconnected", () => console.log("✅ MongoDB reconnected"));
 mongoose.connection.on("error", (err) => {
   console.error("❌ MongoDB error:", err.message);
 });
 
+// Resolves only once the initial connection succeeds (retries until then)
 async function connectDB() {
-  try {
-    await mongoose.connect(process.env.MONGODB_CONNECT, {
-      dbName: "TelegramAi",
-      serverSelectionTimeoutMS: 10000,
-      socketTimeoutMS: 45000,
-      maxPoolSize: 10,
-    });
-    console.log("✅ MongoDB connected");
-  } catch (err) {
-    console.error("❌ MongoDB connection failed:", err.message);
-    setTimeout(connectDB, 5000);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await mongoose.connect(process.env.MONGODB_CONNECT, {
+        dbName: "TelegramAi",
+        serverSelectionTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+        maxPoolSize: 10,
+      });
+      console.log("✅ MongoDB connected");
+      return;
+    } catch (err) {
+      console.error(`❌ MongoDB connection failed (attempt ${attempt}):`, err.message);
+      await new Promise(r => setTimeout(r, Math.min(5000 * attempt, 30000)));
+    }
   }
 }
 
@@ -159,6 +209,13 @@ userSchema.add({
   banned: { type: Boolean, default: false },
   bannedAt: { type: Date, default: null },
   banReason: { type: String, default: "" },
+  // User blocked the bot (set instead of deleting the user, so approvals/bans survive)
+  blocked: { type: Boolean, default: false },
+  // Per-day file/pro usage, persisted so restarts don't reset limits
+  usageDate: { type: String, default: "" },
+  docUsed: { type: Number, default: 0 },
+  imgUsed: { type: Number, default: 0 },
+  proUsed: { type: Number, default: 0 },
 });
 userSchema.index({ approvedUntil: 1 });
 userSchema.index({ lastActive: 1 });
@@ -193,8 +250,6 @@ const membershipCache = new Map();
 const approvalCache = new Map();
 const banCache = new Map();
 
-const userUsage = new Map();
-
 const userLanguages = new Map();
 const userModels = new Map();
 const _prefsPending = new Map();
@@ -203,7 +258,7 @@ const albumSeen = new Map();
 
 const processingSet = new Set();
 const processingTimers = new Map();
-const PROCESSING_TIMEOUT = 3 * 60 * 1000;
+const PROCESSING_TIMEOUT = 5 * 60 * 1000;
 
 function cid(chatId) { return String(chatId); }
 
@@ -220,13 +275,11 @@ async function safeReply(msg, text, opts = {}) {
 setInterval(() => {
   const now = Date.now();
   const STALE = CFG.CACHE_CLEAR_MIN * 60 * 1000;
-  const today = utcToday();
 
   for (const [k, v] of rateLimitMap) if (now - v > STALE) rateLimitMap.delete(k);
   for (const [k, v] of mediaRateLimit) if (now - v > STALE) mediaRateLimit.delete(k);
   for (const [k, v] of membershipCache) if (now > v.expiry) membershipCache.delete(k);
   for (const [k, v] of approvalCache) if (now > v.expiry) approvalCache.delete(k);
-  for (const [k, v] of userUsage) if (v.date !== today) userUsage.delete(k);
   for (const [k, v] of banCache) if (now > v.expiry) banCache.delete(k);
   if (userLanguages.size > 5000) userLanguages.clear();
   if (userModels.size > 5000) userModels.clear();
@@ -318,6 +371,12 @@ const LANGUAGES = {
   ru: "🇷🇺 Russian", ar: "🇸🇦 Arabic",
 };
 
+// Language name for prompts: "Japanese (ja)" — without the flag emoji
+function langLabel(code) {
+  const name = (LANGUAGES[code] || LANGUAGES.en).replace(/^\S+\s+/, "");
+  return `${name} (${LANGUAGES[code] ? code : "en"})`;
+}
+
 // ============================================================
 //  BOT + EXPRESS SETUP
 // ============================================================
@@ -349,7 +408,9 @@ app.get("/health", (_q, res) => res.json({
   uptime: Math.floor(process.uptime()),
 }));
 
-const bot = new TelegramBot(CFG.TOKEN);
+const bot = new TelegramBot(CFG.TOKEN, {
+  request: { agentOptions: { family: 4 } },
+});
 
 function isPrivateUpdate(update) {
   const chat =
@@ -402,38 +463,53 @@ function needsDailyReset(dateField) {
 }
 
 function withTimeout(promise, ms, label) {
-  const timer = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms)
-  );
-  return Promise.race([promise, timer]);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-function getUsageBucket(chatId) {
-  const today = utcToday();
+// ---- Per-user daily doc / image / pro usage, persisted in MongoDB ----
+const USAGE_FIELD = { doc: "docUsed", img: "imgUsed", pro: "proUsed" };
+
+async function getUsage(chatId) {
+  const u = await User.findOne(
+    { chatId: cid(chatId) },
+    { usageDate: 1, docUsed: 1, imgUsed: 1, proUsed: 1 }
+  ).lean();
+  if (!u || u.usageDate !== utcToday()) return { doc: 0, img: 0, pro: 0 };
+  return { doc: u.docUsed || 0, img: u.imgUsed || 0, pro: u.proUsed || 0 };
+}
+
+async function hasQuotaLeft(chatId, type, limit) {
+  return (await getUsage(chatId))[type] < limit;
+}
+
+async function incUsage(chatId, type) {
   const key = cid(chatId);
-  let u = userUsage.get(key);
-  if (!u || u.date !== today) {
-    u = { date: today, doc: 0, img: 0, proTokens: 0 };
-    userUsage.set(key, u);
-  }
-  return u;
-}
-
-function checkLimit(chatId, type, limit) {
-  const u = getUsageBucket(chatId);
-  if (u[type] >= limit) return false;
-  u[type]++;
-  return true;
-}
-
-function hasQuotaLeft(chatId, type, limit) {
-  return getUsageBucket(chatId)[type] < limit;
+  const today = utcToday();
+  // New day → zero the counters first
+  await User.updateOne(
+    { chatId: key, usageDate: { $ne: today } },
+    { $set: { usageDate: today, docUsed: 0, imgUsed: 0, proUsed: 0 } }
+  );
+  await User.updateOne({ chatId: key }, { $inc: { [USAGE_FIELD[type]]: 1 } }, { upsert: true });
 }
 
 async function commitLimit(chatId, type) {
-  const u = getUsageBucket(chatId);
-  u[type]++;
+  await incUsage(chatId, type);
   await bumpStats({ [type]: 1 });
+}
+
+// Picks the user's chosen model; falls back to the first model that has BOTH a key and a name
+function usableModels() {
+  return Object.values(MODELS).filter(m => m.key && m.name);
+}
+function resolveModel(selectedId) {
+  const m = MODELS[selectedId];
+  if (m?.key && m?.name) return m;
+  return usableModels()[0] || m || MODELS.gemini_1;
 }
 
 async function isUserMember(chatId) {
@@ -449,7 +525,9 @@ async function isUserMember(chatId) {
         5000, "membership"
       );
       const isMember = ["creator", "administrator", "member"].includes(member.status);
-      membershipCache.set(key, { isMember, expiry: Date.now() + CFG.MEMBER_CACHE_MIN * 60000 });
+      // Cache "not a member" only briefly so someone who just joined isn't locked out
+      const ttl = isMember ? CFG.MEMBER_CACHE_MIN * 60000 : 20000;
+      membershipCache.set(key, { isMember, expiry: Date.now() + ttl });
       return isMember;
     } catch (err) {
       if (attempt === 0) {
@@ -583,7 +661,7 @@ async function reserveQuota(chatId, promptText) {
     throw new Error("DAILY_REQUEST_LIMIT");
   }
 
-  const inputTokens = Math.ceil(String(promptText).split(/\s+/).length * 1.3);
+  const inputTokens = estimateTokens(promptText);
   if (user.tokensUsed + inputTokens >= CFG.DAILY_TOKEN_LIMIT) {
     throw new Error("DAILY_TOKEN_LIMIT");
   }
@@ -591,22 +669,31 @@ async function reserveQuota(chatId, promptText) {
   return { user, inputTokens };
 }
 
-async function finalizeUsage(chatId, user, inputTokens, reply, chosen) {
-  const outputTokens = Math.ceil(String(reply).split(/\s+/).length * 1.3);
-  const totalTokens = inputTokens + outputTokens;
+// Rough estimate used only for the pre-check (and as a fallback when the provider
+// reports no usage). Works for space-less scripts (Japanese etc.) via a char-based bound.
+function estimateTokens(text) {
+  const s = String(text || "");
+  const byWords = s.split(/\s+/).filter(Boolean).length * 1.3;
+  const byChars = s.length / 3.5;
+  return Math.ceil(Math.max(byWords, byChars));
+}
 
-  if (user.tokensUsed + totalTokens > CFG.DAILY_TOKEN_LIMIT) {
-    throw new Error("DAILY_TOKEN_LIMIT");
-  }
+// realTotal = total tokens reported by the provider (preferred over the estimate)
+async function finalizeUsage(chatId, user, inputTokens, reply, chosen, realTotal) {
+  const estimate = inputTokens + estimateTokens(reply);
+  const totalTokens = Number.isFinite(realTotal) && realTotal > 0 ? Math.ceil(realTotal) : estimate;
+
+  // The reply is already generated: deliver it and clamp usage at the cap instead of throwing it away
+  const newTotal = Math.min(user.tokensUsed + totalTokens, CFG.DAILY_TOKEN_LIMIT);
 
   await User.findOneAndUpdate(
     { chatId: cid(chatId) },
-    { $inc: { requests: 1, tokensUsed: totalTokens }, $set: { lastActive: new Date() } }
+    { $inc: { requests: 1 }, $set: { tokensUsed: newTotal, lastActive: new Date(), blocked: false } }
   );
   await bumpStats({ tokens: totalTokens, requests: 1 });
 
-  const remaining = CFG.DAILY_REQUEST_LIMIT - (user.requests + 1);
-  const tokLeft = CFG.DAILY_TOKEN_LIMIT - (user.tokensUsed + totalTokens);
+  const remaining = Math.max(0, CFG.DAILY_REQUEST_LIMIT - (user.requests + 1));
+  const tokLeft = Math.max(0, CFG.DAILY_TOKEN_LIMIT - newTotal);
   return `\n\n🤖 <b>${escapeHtml(chosen.name || "")}</b>  |  📨 ${remaining} left  |  🪙 ${tokLeft} tokens`;
 }
 
@@ -659,9 +746,10 @@ async function safeSend(chatId, text, opts = {}) {
     }
 
     if (code === 403 || msg.includes("Forbidden") || msg.includes("bot was blocked")) {
-      console.warn(`⚠️ Bot blocked by ${chatId} — removing from DB`);
-      User.deleteOne({ chatId: cid(chatId) }).catch(e =>
-        console.error("❌ Failed to remove blocked user:", e.message)
+      console.warn(`⚠️ Bot blocked by ${chatId} — flagging as blocked`);
+      // Keep the User document (approval / ban state must survive a block + unblock)
+      User.updateOne({ chatId: cid(chatId) }, { $set: { blocked: true } }).catch(e =>
+        console.error("❌ Failed to flag blocked user:", e.message)
       );
       ChatHistory.deleteOne({ chatId: cid(chatId) }).catch(e =>
         console.error("❌ Failed to remove blocked user history:", e.message)
@@ -719,12 +807,14 @@ function mdToHtml(md) {
   t = t.replace(/~~([^\n]+?)~~/g, "<s>$1</s>");
   t = t.replace(/(^|[^\w*])\*(?!\s)([^*\n]+?)\*(?!\w)/g, "$1<i>$2</i>");
   t = t.replace(/(^|[^\w])_(?!\s)([^_\n]+?)_(?!\w)/g, "$1<i>$2</i>");
-  t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
+  t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    (_, label, url) => `<a href="${url.replace(/"/g, "&quot;")}">${label}</a>`);
 
   return t.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)]);
 }
 
-function splitMarkdown(text, maxLen = 3000) {
+// 2500 leaves headroom: HTML escaping (&amp; &lt;) and tags expand text past Telegram's 4096 limit
+function splitMarkdown(text, maxLen = 2500) {
   const chunks = [];
   let rest = String(text);
   let reopen = "";
@@ -743,6 +833,53 @@ function splitMarkdown(text, maxLen = 3000) {
   return chunks;
 }
 
+// Repairs mis-nested tags like <b><i>..</b></i> that Telegram rejects
+function fixHtmlNesting(html) {
+  const out = [];
+  const stack = [];
+  for (const p of html.split(/(<[^>]+>)/)) {
+    const m = p.match(/^<(\/?)([a-z]+)[^>]*>$/i);
+    if (!m) { out.push(p); continue; }
+    const name = m[2].toLowerCase();
+    if (!m[1]) { stack.push({ name, tag: p }); out.push(p); continue; }
+
+    const idx = stack.map(x => x.name).lastIndexOf(name);
+    if (idx === -1) continue; // stray closing tag, drop it
+    const reopen = [];
+    while (stack.length - 1 > idx) {
+      const x = stack.pop();
+      out.push(`</${x.name}>`);
+      if (["b", "i", "s"].includes(x.name)) reopen.push(x);
+    }
+    stack.pop();
+    out.push(p);
+    for (const x of reopen.reverse()) { stack.push(x); out.push(x.tag); }
+  }
+  while (stack.length) out.push(`</${stack.pop().name}>`);
+  return out.join("");
+}
+
+function htmlToPlain(h) {
+  return h.replace(/<[^>]+>/g, "")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+const isParseErr = (e) =>
+  /can't parse entities|unsupported start tag|unexpected end tag/i.test(e?.message || "");
+
+// Retries network errors / 429 / 5xx. Throws immediately on other 4xx (e.g. parse errors)
+async function sendWithRetry(chatId, text, opts, tries = 3) {
+  for (let i = 1; ; i++) {
+    try { return await bot.sendMessage(chatId, text, opts); }
+    catch (err) {
+      const code = err?.response?.statusCode;
+      if (isParseErr(err) || i >= tries || (code && code !== 429 && code < 500)) throw err;
+      const ra = err?.response?.body?.parameters?.retry_after;
+      await new Promise(r => setTimeout(r, ra ? ra * 1000 : 800 * i));
+    }
+  }
+}
+
 async function sendAIReply(chatId, header, reply, truncated, footerHtml) {
   const chunks = splitMarkdown(reply);
   for (let i = 0; i < chunks.length; i++) {
@@ -751,17 +888,23 @@ async function sendAIReply(chatId, header, reply, truncated, footerHtml) {
 
     let html = mdToHtml(chunks[i]);
     if (isFirst && header) html = `<b>${escapeHtml(header)}</b>\n\n${html}`;
+    html = fixHtmlNesting(html);
     if (isLast) {
       if (truncated) html += "\n\n⚠️ <i>The reply hit the length limit and was cut off. Send “continue” to get the rest.</i>";
       html += footerHtml || "";
     }
 
     try {
-      await bot.sendMessage(chatId, html, { parse_mode: "HTML", disable_web_page_preview: true });
+      await sendWithRetry(chatId, html, { parse_mode: "HTML", disable_web_page_preview: true });
     } catch (err) {
-      console.warn(`⚠️ HTML send failed for ${chatId}, falling back to plain text: ${err.message}`);
-      const plain = (isFirst && header ? header + "\n\n" : "") + chunks[i];
-      await safeSend(chatId, plain);
+      console.warn(`⚠️ HTML send failed for ${chatId}: ${err.message} — sending cleaned plain text`);
+      try {
+        for (const part of splitSafely(htmlToPlain(html))) {
+          await sendWithRetry(chatId, part, { disable_web_page_preview: true });
+        }
+      } catch (err2) {
+        console.error(`❌ Plain fallback failed for ${chatId}: ${err2.message}`);
+      }
     }
     if (!isLast) await new Promise(r => setTimeout(r, 350));
   }
@@ -785,18 +928,37 @@ async function withThinkingIndicator(chatId, label, fn) {
   }
 }
 
-function checkProLimit(chatId, chosen) {
+// Pro quota: checked before the call, but only charged after the call succeeds
+async function checkProLimit(chatId, chosen) {
+  if (chosen.id === "pro" && !(await hasQuotaLeft(chatId, "pro", CFG.PRO_LIMIT))) {
+    throw new Error(`PRO_LIMIT:${CFG.PRO_LIMIT}`);
+  }
+}
+async function countProUse(chatId, chosen) {
   if (chosen.id === "pro") {
-    if (!checkLimit(chatId, "proTokens", CFG.PRO_LIMIT)) {
-      throw new Error(`PRO_LIMIT:${CFG.PRO_LIMIT}`);
-    }
+    await incUsage(chatId, "pro").catch(e => console.error("❌ pro usage error:", e.message));
+  }
+}
+
+// response.text() throws when Gemini blocks the response (safety etc.)
+function geminiText(result) {
+  const r = result?.response;
+  try { return r?.text() || ""; }
+  catch {
+    const why = r?.promptFeedback?.blockReason || r?.candidates?.[0]?.finishReason;
+    return `⚠️ Gemini refused to answer this${why ? ` (${why})` : ""}. Try rephrasing your request.`;
   }
 }
 
 async function callModel(chatId, chosen, promptText) {
   if (!chosen?.key) throw new Error("NO_KEY");
-  checkProLimit(chatId, chosen);
+  await checkProLimit(chatId, chosen);
+  const out = await callModelRaw(chosen, promptText);
+  await countProUse(chatId, chosen);
+  return out;
+}
 
+async function callModelRaw(chosen, promptText) {
   if (chosen.provider === "gemini") {
     const model = genAI.getGenerativeModel({ model: chosen.model });
     const result = await withTimeout(
@@ -807,9 +969,10 @@ async function callModel(chatId, chosen, promptText) {
       CFG.API_TIMEOUT_MS, "gemini"
     );
     return {
-      reply: result?.response?.text() || "⚠️ No response from Gemini (the model may have used its whole token budget on thinking).",
+      reply: geminiText(result) || "⚠️ No response from Gemini (the model may have used its whole token budget on thinking).",
       chosen,
       truncated: result?.response?.candidates?.[0]?.finishReason === "MAX_TOKENS",
+      totalTokens: result?.response?.usageMetadata?.totalTokenCount,
     };
   }
 
@@ -829,6 +992,7 @@ async function callModel(chatId, chosen, promptText) {
       reply: result.choices[0].message.content || "⚠️ No response from OpenAI (the model may have used its whole token budget on reasoning).",
       chosen,
       truncated: result.choices[0].finish_reason === "length",
+      totalTokens: result.usage?.total_tokens,
     };
   }
 
@@ -845,6 +1009,7 @@ async function callModel(chatId, chosen, promptText) {
       reply: result.content?.find(b => b.type === "text")?.text || "⚠️ No response from Claude.",
       chosen,
       truncated: result.stop_reason === "max_tokens",
+      totalTokens: (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
     };
   }
 
@@ -853,8 +1018,13 @@ async function callModel(chatId, chosen, promptText) {
 
 async function callVisionModel(chatId, chosen, base64Image, mimeType, instructionText) {
   if (!chosen?.key) throw new Error("NO_KEY");
-  checkProLimit(chatId, chosen);
+  await checkProLimit(chatId, chosen);
+  const out = await callVisionModelRaw(chosen, base64Image, mimeType, instructionText);
+  await countProUse(chatId, chosen);
+  return out;
+}
 
+async function callVisionModelRaw(chosen, base64Image, mimeType, instructionText) {
   if (chosen.provider === "gemini") {
     const model = genAI.getGenerativeModel({ model: chosen.model });
     const result = await withTimeout(
@@ -865,9 +1035,10 @@ async function callVisionModel(chatId, chosen, base64Image, mimeType, instructio
       CFG.API_TIMEOUT_MS, "gemini-img"
     );
     return {
-      reply: result?.response?.text() || "⚠️ No response from Gemini (the model may have used its whole token budget on thinking).",
+      reply: geminiText(result) || "⚠️ No response from Gemini (the model may have used its whole token budget on thinking).",
       chosen,
       truncated: result?.response?.candidates?.[0]?.finishReason === "MAX_TOKENS",
+      totalTokens: result?.response?.usageMetadata?.totalTokenCount,
     };
   }
 
@@ -890,6 +1061,7 @@ async function callVisionModel(chatId, chosen, base64Image, mimeType, instructio
       reply: result.choices[0].message.content || "⚠️ No response from OpenAI (the model may have used its whole token budget on reasoning).",
       chosen,
       truncated: result.choices[0].finish_reason === "length",
+      totalTokens: result.usage?.total_tokens,
     };
   }
 
@@ -912,6 +1084,7 @@ async function callVisionModel(chatId, chosen, base64Image, mimeType, instructio
       reply: result.content?.find(b => b.type === "text")?.text || "⚠️ No response from Claude.",
       chosen,
       truncated: result.stop_reason === "max_tokens",
+      totalTokens: (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
     };
   }
 
@@ -919,9 +1092,8 @@ async function callVisionModel(chatId, chosen, base64Image, mimeType, instructio
 }
 
 async function getAIReply(chatId, text, history, lang) {
-  const selectedId = userModels.get(cid(chatId)) || "gemini_1";
-  const chosen = MODELS[selectedId];
-  const prompt = `Answer in ${LANGUAGES[lang] || "English"} (${lang}).\n${CFG.STYLE_PROMPT}\n\nConversation so far:\n${history}\n\nUser: ${text}`;
+  const chosen = resolveModel(userModels.get(cid(chatId)) || "gemini_1");
+  const prompt = `Answer in ${langLabel(lang)}.\n${CFG.STYLE_PROMPT}\n\nConversation so far:\n${history}\n\nUser: ${text}`;
   return callModel(chatId, chosen, prompt);
 }
 
@@ -978,12 +1150,27 @@ async function broadcastMessage(message) {
   let success = 0, failed = 0;
   const DELAY = 220;
 
-  const cursor = User.find({ banned: { $ne: true } }, { chatId: 1 }).cursor();
+  const cursor = User.find({ banned: { $ne: true }, blocked: { $ne: true } }, { chatId: 1 }).cursor();
   for await (const u of cursor) {
-    try {
-      await bot.sendMessage(u.chatId, `📢 Broadcast:\n\n${message}`);
-      success++;
-    } catch { failed++; }
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await bot.sendMessage(u.chatId, `📢 Broadcast:\n\n${message}`);
+        success++;
+        break;
+      } catch (err) {
+        const code = err?.response?.statusCode;
+        if (code === 429 && attempt === 1) {
+          const ra = err?.response?.body?.parameters?.retry_after || 5;
+          await new Promise(r => setTimeout(r, ra * 1000));
+          continue;
+        }
+        if (code === 403) {
+          User.updateOne({ chatId: u.chatId }, { $set: { blocked: true } }).catch(() => { });
+        }
+        failed++;
+        break;
+      }
+    }
     await new Promise(r => setTimeout(r, DELAY));
   }
   return { success, failed };
@@ -993,12 +1180,21 @@ async function broadcastMessage(message) {
 //  STARTUP
 // ============================================================
 async function startup() {
-  await connectDB();
+  // Bind the port first so Render's port check passes while we connect to MongoDB
+  app.listen(CFG.PORT, () => console.log(`✅ Server on port ${CFG.PORT}`));
 
-  try {
-    const s = await Setting.findOne({ key: "publicMode" });
-    if (s) PUBLIC_MODE = !!s.value;
-  } catch { }
+  await connectDB(); // retries until connected, so publicMode below is always loaded
+
+  for (let i = 1; i <= 3; i++) {
+    try {
+      const s = await Setting.findOne({ key: "publicMode" });
+      if (s) PUBLIC_MODE = !!s.value;
+      break;
+    } catch (err) {
+      console.error(`⚠️ Could not load publicMode (try ${i}/3):`, err.message);
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
   console.log(`🔑 PUBLIC_MODE: ${PUBLIC_MODE}`);
 
   try {
@@ -1010,8 +1206,6 @@ async function startup() {
   } catch (err) {
     console.error("❌ Webhook registration failed:", err.message);
   }
-
-  app.listen(CFG.PORT, () => console.log(`✅ Server on port ${CFG.PORT}`));
 
   runCleanup();
   setInterval(runCleanup, 24 * 60 * 60 * 1000);
@@ -1058,6 +1252,8 @@ bot.onText(cmd("start"), async (msg) => {
   const uid = senderId(msg);
 
   await getOrCreateUser(uid);
+  // If they had blocked the bot before, they're back
+  User.updateOne({ chatId: cid(uid) }, { $set: { blocked: false } }).catch(() => { });
   const key = cid(uid);
   if (!userModels.has(key)) userModels.set(key, "gemini_1");
   if (!userLanguages.has(key)) userLanguages.set(key, "en");
@@ -1199,7 +1395,7 @@ bot.onText(cmd("account"), async (msg) => {
     await hydrateUserPrefs(uid);
     const lang = userLanguages.get(cid(uid)) || user.language || "en";
     const model = userModels.get(cid(uid)) || user.selectedModel || "gemini_1";
-    const usage = getUsageBucket(uid);
+    const usage = await getUsage(uid);
     const reset = new Date(); reset.setUTCHours(24, 0, 0, 0);
 
     await safeReply(msg,
@@ -1213,7 +1409,7 @@ bot.onText(cmd("account"), async (msg) => {
       `📁 *Files Today*\n` +
       `Documents — ${usage.doc || 0} / ${CFG.DOC_LIMIT}\n` +
       `Photos — ${usage.img || 0} / ${CFG.IMG_LIMIT}\n` +
-      (MODELS.pro ? `Pro model — ${usage.proTokens || 0} / ${CFG.PRO_LIMIT}\n` : ``) +
+      (MODELS.pro ? `Pro model — ${usage.pro || 0} / ${CFG.PRO_LIMIT}\n` : ``) +
       `\n⚙️ *Preferences*\n` +
       `Language — ${LANGUAGES[lang] || lang}\n` +
       `Model — ${escapeMarkdown(MODELS[model]?.name || model)}`,
@@ -1236,7 +1432,8 @@ function buildLanguageKeyboard(current) {
 }
 
 function buildModelKeyboard(current) {
-  return Object.entries(MODELS).map(([id, m]) => {
+  // Skip entries with no model name (env var not set): empty button text makes Telegram reject the keyboard
+  return Object.entries(MODELS).filter(([, m]) => m.name).map(([id, m]) => {
     let label = id === "pro" ? `${m.name} ⭐ Pro` : m.name;
     if (id === current) label = `✅ ${label}`;
     return [{
@@ -1324,7 +1521,7 @@ bot.on("callback_query", async (query) => {
 
   if (data.startsWith("model_")) {
     const modelId = data.slice(6);
-    if (!MODELS[modelId]?.key) {
+    if (!MODELS[modelId]?.key || !MODELS[modelId]?.name) {
       bot.answerCallbackQuery(query.id, { text: "⚠️ Model not available.", show_alert: true }).catch(() => { });
       return;
     }
@@ -1381,7 +1578,7 @@ bot.on("document", async (msg) => {
   if (isProcessing(uid)) {
     return safeReply(msg, "⏳ Your previous request is still in progress.");
   }
-  if (!hasQuotaLeft(uid, "doc", CFG.DOC_LIMIT)) {
+  if (!await hasQuotaLeft(uid, "doc", CFG.DOC_LIMIT)) {
     return safeReply(msg, `⚠️ Daily document limit reached (${CFG.DOC_LIMIT}). Try again tomorrow.`);
   }
 
@@ -1396,6 +1593,7 @@ bot.on("document", async (msg) => {
   markProcessing(uid);
   try {
     await enqueueRequest(async () => {
+      markProcessing(uid); // restart the safety timer now that the task has actually started
       await withThinkingIndicator(chatId, "📄 Analysing your document, please wait…", async () => {
         let fileBuffer;
         try {
@@ -1408,8 +1606,7 @@ bot.on("document", async (msg) => {
 
         let text = "";
         if (fileName.endsWith(".pdf")) {
-          const data = await withTimeout(pdf(fileBuffer), CFG.API_TIMEOUT_MS, "pdf-parse");
-          text = data.text;
+          text = await withTimeout(parsePdf(fileBuffer), CFG.API_TIMEOUT_MS, "pdf-parse");
         } else if (fileName.endsWith(".docx")) {
           const data = await withTimeout(mammoth.extractRawText({ buffer: fileBuffer }), CFG.API_TIMEOUT_MS, "mammoth");
           text = data.value;
@@ -1419,24 +1616,30 @@ bot.on("document", async (msg) => {
         fileBuffer = null;
 
         if (!text.trim()) return safeReply(msg, "⚠️ No readable text found.");
-        if (text.length > CFG.DOC_CHAR_LIMIT) text = text.slice(0, CFG.DOC_CHAR_LIMIT);
+        let docTruncated = false;
+        if (text.length > CFG.DOC_CHAR_LIMIT) {
+          text = text.slice(0, CFG.DOC_CHAR_LIMIT);
+          docTruncated = true;
+        }
 
         await hydrateUserPrefs(uid);
         const lang = userLanguages.get(cid(uid)) || "en";
-        const selectedId = userModels.get(cid(uid)) || "gemini_1";
-        const chosen = MODELS[selectedId];
+        const chosen = resolveModel(userModels.get(cid(uid)) || "gemini_1");
 
-        const langName = `${LANGUAGES[lang] || "English"} (${lang})`;
+        const langName = langLabel(lang);
         const prompt = caption
           ? `Answer the user's question about the document below, based on its content. If the document does not contain the answer, say so. Answer in ${langName}.\n${CFG.STYLE_PROMPT}\n\nQuestion: ${caption}\n\nDocument:\n${text}`
           : `Summarize this document briefly: the main point first, then only the key takeaways. Answer in ${langName}.\n${CFG.STYLE_PROMPT}\n\nDocument:\n${text}`;
         const { user, inputTokens } = await reserveQuota(uid, prompt);
 
-        const { reply, chosen: usedModel, truncated } = await callModel(uid, chosen, prompt);
+        const { reply, chosen: usedModel, truncated, totalTokens } = await callModel(uid, chosen, prompt);
 
         await commitLimit(uid, "doc");
 
-        const footer = await finalizeUsage(uid, user, inputTokens, reply, usedModel);
+        let footer = await finalizeUsage(uid, user, inputTokens, reply, usedModel, totalTokens);
+        if (docTruncated) {
+          footer = `\n\n⚠️ <i>Only the first ${CFG.DOC_CHAR_LIMIT} characters of the document were analysed.</i>` + footer;
+        }
         await appendChatHistory(
           uid,
           `[Document: ${msg.document.file_name || "file"}] ${caption || "Summarize this document"}`,
@@ -1446,7 +1649,7 @@ bot.on("document", async (msg) => {
       });
     });
   } catch (err) {
-    console.error("❌ Document error:", err.message);
+    console.error("❌ Document error:", redact(err.message));
     await safeReply(msg, err.message === "QUEUE_FULL"
       ? "⚠️ Bot is busy. Please try again in a moment."
       : err.message === "DAILY_REQUEST_LIMIT"
@@ -1484,7 +1687,7 @@ bot.on("photo", async (msg) => {
   if (isProcessing(uid)) {
     return safeReply(msg, "⏳ Your previous request is still in progress.");
   }
-  if (!hasQuotaLeft(uid, "img", CFG.IMG_LIMIT)) {
+  if (!await hasQuotaLeft(uid, "img", CFG.IMG_LIMIT)) {
     return safeReply(msg, `⚠️ Daily image analysis limit reached (${CFG.IMG_LIMIT}). Try again tomorrow.`);
   }
 
@@ -1493,6 +1696,7 @@ bot.on("photo", async (msg) => {
   markProcessing(uid);
   try {
     await enqueueRequest(async () => {
+      markProcessing(uid); // restart the safety timer now that the task has actually started
       await withThinkingIndicator(chatId, "🖼️ Analysing your image, please wait…", async () => {
         let fileBuffer;
         try {
@@ -1508,28 +1712,27 @@ bot.on("photo", async (msg) => {
 
         await hydrateUserPrefs(uid);
         const lang = userLanguages.get(cid(uid)) || "en";
-        const selectedId = userModels.get(cid(uid)) || "gemini_1";
-        const chosen = MODELS[selectedId];
-        const langName = `${LANGUAGES[lang] || "English"} (${lang})`;
+        const chosen = resolveModel(userModels.get(cid(uid)) || "gemini_1");
+        const langName = langLabel(lang);
         const instruction = caption
           ? `The user sent this image with a question or instruction. Answer it based on the image. Answer in ${langName}.\n${CFG.STYLE_PROMPT}\n\nUser's question: ${caption}`
           : `Describe this image concisely: what it shows and anything important in it. Answer in ${langName}.\n${CFG.STYLE_PROMPT}`;
 
         const { user, inputTokens } = await reserveQuota(uid, instruction);
 
-        const { reply, chosen: usedModel, truncated } = await callVisionModel(
+        const { reply, chosen: usedModel, truncated, totalTokens } = await callVisionModel(
           uid, chosen, base64Image, "image/jpeg", instruction
         );
 
         await commitLimit(uid, "img");
 
-        const footer = await finalizeUsage(uid, user, inputTokens, reply, usedModel);
+        const footer = await finalizeUsage(uid, user, inputTokens, reply, usedModel, totalTokens);
         await appendChatHistory(uid, `[Image] ${caption || "Describe this image"}`, reply, truncated);
         await sendAIReply(chatId, caption ? "🖼️ Image Answer:" : "🖼️ Image Analysis:", reply, truncated, footer);
       });
     });
   } catch (err) {
-    console.error("❌ Image analysis error:", err.message);
+    console.error("❌ Image analysis error:", redact(err.message));
     await safeReply(msg, err.message === "QUEUE_FULL"
       ? "⚠️ Bot is busy. Please try again in a moment."
       : err.message === "DAILY_REQUEST_LIMIT"
@@ -1579,9 +1782,13 @@ async function runAiPipeline(msg, text) {
   markProcessing(uid);
   try {
     await enqueueRequest(async () => {
+      markProcessing(uid); // restart the safety timer now that the task has actually started
+      const history = await getRecentHistory(uid);
+
       let quota;
       try {
-        quota = await reserveQuota(uid, text);
+        // Count the history too, since it is sent to the model with every request
+        quota = await reserveQuota(uid, `${CFG.STYLE_PROMPT}\n${history}\n${text}`);
       } catch (err) {
         if (err.message === "DAILY_REQUEST_LIMIT") return safeReply(msg, `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`);
         if (err.message === "DAILY_TOKEN_LIMIT") return safeReply(msg, `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`);
@@ -1591,8 +1798,6 @@ async function runAiPipeline(msg, text) {
 
       await hydrateUserPrefs(uid);
       const lang = userLanguages.get(cid(uid)) || "en";
-
-      const history = await getRecentHistory(uid);
 
       let aiResult;
       try {
@@ -1606,13 +1811,7 @@ async function runAiPipeline(msg, text) {
 
       const { reply, chosen, truncated } = aiResult;
 
-      let footer;
-      try {
-        footer = await finalizeUsage(uid, user, inputTokens, reply, chosen);
-      } catch (err) {
-        if (err.message === "DAILY_TOKEN_LIMIT") return safeReply(msg, "⚠️ Reply would exceed daily token limit. Try again tomorrow.");
-        throw err;
-      }
+      const footer = await finalizeUsage(uid, user, inputTokens, reply, chosen, aiResult.totalTokens);
 
       await appendChatHistory(uid, text, reply, truncated);
 
@@ -1622,7 +1821,7 @@ async function runAiPipeline(msg, text) {
     if (err.message === "QUEUE_FULL") {
       return safeReply(msg, "⚠️ Bot is very busy. Please try again shortly.");
     }
-    console.error("❌ Chat error:", err.message);
+    console.error("❌ Chat error:", redact(err.message));
     await safeReply(msg, "❌ Something went wrong. Please try again.");
   } finally {
     unmarkProcessing(uid);
@@ -1741,7 +1940,7 @@ bot.onText(cmd("users"), async (msg) => {
       const rem = Math.max(0, Math.ceil((new Date(u.approvedUntil) - Date.now()) / 3600000)) + "h";
       text += `${i + 1}. \`${u.chatId}\` — ⏳ ${rem}\n`;
     });
-    bot.sendMessage(CFG.ADMIN_ID, text, { parse_mode: "Markdown" }).catch(() => { });
+    await sendLongMessage(CFG.ADMIN_ID, text, { parse_mode: "Markdown" });
   } catch (err) {
     console.error("users error:", err.message);
     bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not list users.").catch(() => { });
