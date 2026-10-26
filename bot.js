@@ -1275,11 +1275,30 @@ bot.on("callback_query", async (query) => {
   const uid = query.from?.id ?? chatId;
   const data = query.data || "";
 
-  const refreshKeyboard = (keyboard) =>
-    bot.editMessageReplyMarkup(
-      { inline_keyboard: keyboard },
-      { chat_id: chatId, message_id: query.message.message_id }
-    ).catch(() => { });
+  const refreshKeyboard = async (keyboard, title) => {
+    const opts = { chat_id: chatId, message_id: query.message.message_id };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await bot.editMessageReplyMarkup({ inline_keyboard: keyboard }, opts);
+        return;
+      } catch (err) {
+        const m = err?.message || "";
+        if (m.includes("message is not modified")) return;
+        if (attempt === 0) {
+          const wait = (err?.response?.body?.parameters?.retry_after || 1) * 1000;
+          await new Promise(r => setTimeout(r, Math.min(wait, 5000)));
+          continue;
+        }
+        try {
+          await bot.sendMessage(chatId, title, {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: keyboard },
+          });
+          bot.deleteMessage(chatId, query.message.message_id).catch(() => { });
+        } catch { }
+      }
+    }
+  };
 
   if (data.startsWith("lang_")) {
     const lang = data.slice(5);
@@ -1292,13 +1311,14 @@ bot.on("callback_query", async (query) => {
 
     if (lang === current) {
       bot.answerCallbackQuery(query.id, { text: `Already using ${LANGUAGES[lang]}` }).catch(() => { });
+      await refreshKeyboard(buildLanguageKeyboard(current), "🌐 *Choose AI Language*");
       return;
     }
 
     userLanguages.set(cid(uid), lang);
     User.findOneAndUpdate({ chatId: cid(uid) }, { $set: { language: lang } }, { upsert: true }).catch(() => { });
     bot.answerCallbackQuery(query.id, { text: "✅ Language changed" }).catch(() => { });
-    await refreshKeyboard(buildLanguageKeyboard(lang));
+    await refreshKeyboard(buildLanguageKeyboard(lang), "🌐 *Choose AI Language*");
     return;
   }
 
@@ -1313,13 +1333,14 @@ bot.on("callback_query", async (query) => {
 
     if (modelId === current) {
       bot.answerCallbackQuery(query.id, { text: "Already using this model" }).catch(() => { });
+      await refreshKeyboard(buildModelKeyboard(current), "🧠 *Select AI Model*");
       return;
     }
 
     userModels.set(cid(uid), modelId);
     User.findOneAndUpdate({ chatId: cid(uid) }, { $set: { selectedModel: modelId } }, { upsert: true }).catch(() => { });
     bot.answerCallbackQuery(query.id, { text: "✅ Model changed" }).catch(() => { });
-    await refreshKeyboard(buildModelKeyboard(modelId));
+    await refreshKeyboard(buildModelKeyboard(modelId), "🧠 *Select AI Model*");
     return;
   }
 
