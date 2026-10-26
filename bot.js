@@ -1,8 +1,3 @@
-// ============================================================
-//  bot.js  —  Telegram AI Bot  (Production Hardened)
-//  Architecture: Webhook · MongoDB Atlas Free · Render Free
-// ============================================================
-
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
@@ -20,7 +15,7 @@ const mammoth = require("mammoth");
 dotenv.config();
 
 // ============================================================
-//  SECTION 1 · ENV CONFIGURATION
+//  ENV CONFIGURATION
 // ============================================================
 const CFG = {
   TOKEN: process.env.TELEGRAM_TOKEN,
@@ -88,14 +83,11 @@ function validateEnv() {
 }
 validateEnv();
 
-// ============================================================
-//  SECTION 2 · GLOBAL SAFETY NETS
-// ============================================================
 process.on("unhandledRejection", (err) => console.error("⚠️ UnhandledRejection:", err?.message || err));
 process.on("uncaughtException", (err) => console.error("⚠️ UncaughtException:", err?.message || err));
 
 // ============================================================
-//  SECTION 3 · MONGODB — connect first, start bot after
+//  MONGODB
 // ============================================================
 mongoose.connection.on("disconnected", () => {
   console.warn("⚠️ MongoDB disconnected — reconnecting…");
@@ -120,15 +112,12 @@ async function connectDB() {
   }
 }
 
-// ── Schemas ───────────────────────────────────────────────
-
 const settingsSchema = new mongoose.Schema(
   { key: { type: String, required: true, unique: true }, value: mongoose.Schema.Types.Mixed },
   { versionKey: false }
 );
 const Setting = mongoose.model("Setting", settingsSchema);
 
-// ── Daily aggregated stats (one document, resets at UTC midnight) ──
 const dailyStatsSchema = new mongoose.Schema(
   {
     date: { type: String, required: true, unique: true },
@@ -195,9 +184,8 @@ chatHistorySchema.index({ chatId: 1 }, { unique: true });
 const ChatHistory = mongoose.model("ChatHistory", chatHistorySchema);
 
 // ============================================================
-//  SECTION 4 · IN-MEMORY CACHES  (ephemeral runtime data only)
+//  IN-MEMORY CACHES
 // ============================================================
-
 const rateLimitMap = new Map();
 const mediaRateLimit = new Map();
 
@@ -214,6 +202,7 @@ const _prefsPending = new Map();
 const albumSeen = new Map();
 
 const processingSet = new Set();
+const processingTimers = new Map();
 const PROCESSING_TIMEOUT = 3 * 60 * 1000;
 
 function cid(chatId) { return String(chatId); }
@@ -228,7 +217,6 @@ async function safeReply(msg, text, opts = {}) {
   return safeSend(msg.chat.id, text, opts);
 }
 
-// ── Periodic cache sweep — prevents memory leaks ──────────
 setInterval(() => {
   const now = Date.now();
   const STALE = CFG.CACHE_CLEAR_MIN * 60 * 1000;
@@ -247,7 +235,7 @@ setInterval(() => {
 }, CFG.CACHE_CLEAR_MIN * 60 * 1000);
 
 // ============================================================
-//  SECTION 5 · CONCURRENCY LIMITER
+//  CONCURRENCY LIMITER
 // ============================================================
 let activeRequests = 0;
 const requestQueue = [];
@@ -280,7 +268,7 @@ async function enqueueRequest(fn) {
 }
 
 // ============================================================
-//  SECTION 6 · AI MODELS
+//  AI MODELS
 // ============================================================
 function buildProModelEntry() {
   const provider = CFG.PRO_PROVIDER;
@@ -331,7 +319,7 @@ const LANGUAGES = {
 };
 
 // ============================================================
-//  SECTION 7 · BOT + EXPRESS SETUP
+//  BOT + EXPRESS SETUP
 // ============================================================
 let PUBLIC_MODE = false;
 
@@ -363,8 +351,6 @@ app.get("/health", (_q, res) => res.json({
 
 const bot = new TelegramBot(CFG.TOKEN);
 
-// Standalone bot: only private chats are processed.
-// Updates from groups, supergroups and channels are silently ignored.
 function isPrivateUpdate(update) {
   const chat =
     update?.message?.chat ||
@@ -388,7 +374,6 @@ app.post(`/bot${CFG.TOKEN}`, async (req, res) => {
   const update = req.body;
   if (!isPrivateUpdate(update)) return;
 
-  // Banned users are dropped here, before ANY handler (commands, text, files, buttons) runs.
   try {
     if (await isBanned(updateSenderId(update))) return;
   } catch (err) {
@@ -397,7 +382,6 @@ app.post(`/bot${CFG.TOKEN}`, async (req, res) => {
   bot.processUpdate(update);
 });
 
-// ── Bot command menu ──────────────────────────────────────
 bot.setMyCommands([
   { command: "start", description: "🚀 Start the bot" },
   { command: "help", description: "📝 List of commands" },
@@ -408,9 +392,8 @@ bot.setMyCommands([
 ]).catch(() => { });
 
 // ============================================================
-//  SECTION 8 · HELPERS
+//  HELPERS
 // ============================================================
-
 function utcToday() { return new Date().toISOString().slice(0, 10); }
 
 function needsDailyReset(dateField) {
@@ -418,7 +401,6 @@ function needsDailyReset(dateField) {
   return new Date(dateField).toISOString().slice(0, 10) !== utcToday();
 }
 
-// ── Timeout helper ──
 function withTimeout(promise, ms, label) {
   const timer = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms)
@@ -426,7 +408,6 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timer]);
 }
 
-// ── Daily usage counter (in-memory, UTC-aligned) ─────────
 function getUsageBucket(chatId) {
   const today = utcToday();
   const key = cid(chatId);
@@ -455,7 +436,6 @@ async function commitLimit(chatId, type) {
   await bumpStats({ [type]: 1 });
 }
 
-// ── Membership check ──
 async function isUserMember(chatId) {
   if (!CFG.FORCE_CHANNEL) return true;
   const key = cid(chatId);
@@ -499,7 +479,6 @@ async function checkMembership(msg) {
   return false;
 }
 
-// ── Ban check (cached) ──
 async function isBanned(chatId) {
   if (!chatId || Number(chatId) === CFG.ADMIN_ID) return false;
   const key = cid(chatId);
@@ -512,7 +491,6 @@ async function isBanned(chatId) {
   return banned;
 }
 
-// ── Approval check ──
 async function isUserApproved(chatId) {
   if (PUBLIC_MODE) return true;
   if (chatId === CFG.ADMIN_ID) return true;
@@ -534,7 +512,6 @@ async function guardAccess(msg) {
   return false;
 }
 
-// ── Rate limiters ─────────────────────────────────────────
 async function guardRateLimit(msg) {
   if (msg.text?.startsWith("/")) return true;
   if (msg.photo || msg.document) return true;
@@ -561,16 +538,23 @@ async function guardRateLimitMedia(msg) {
   return true;
 }
 
-// ── Processing lock ──
 function isProcessing(chatId) { return processingSet.has(cid(chatId)); }
 function markProcessing(chatId) {
   const key = cid(chatId);
+  clearTimeout(processingTimers.get(key));
   processingSet.add(key);
-  setTimeout(() => processingSet.delete(key), PROCESSING_TIMEOUT);
+  processingTimers.set(key, setTimeout(() => {
+    processingSet.delete(key);
+    processingTimers.delete(key);
+  }, PROCESSING_TIMEOUT));
 }
-function unmarkProcessing(chatId) { processingSet.delete(cid(chatId)); }
+function unmarkProcessing(chatId) {
+  const key = cid(chatId);
+  clearTimeout(processingTimers.get(key));
+  processingTimers.delete(key);
+  processingSet.delete(key);
+}
 
-// ── User upsert ──
 async function getOrCreateUser(chatId) {
   const key = cid(chatId);
   try {
@@ -585,7 +569,6 @@ async function getOrCreateUser(chatId) {
   }
 }
 
-// ── Usage accounting (chat, documents, photos) ──
 async function reserveQuota(chatId, promptText) {
   const user = await getOrCreateUser(chatId);
 
@@ -627,7 +610,6 @@ async function finalizeUsage(chatId, user, inputTokens, reply, chosen) {
   return `\n\n🤖 <b>${escapeHtml(chosen.name || "")}</b>  |  📨 ${remaining} left  |  🪙 ${tokLeft} tokens`;
 }
 
-// ── File download with pre-flight size check ──────────────
 async function downloadFile(fileId) {
   const file = await withTimeout(bot.getFile(fileId), CFG.API_TIMEOUT_MS, "getFile");
   const MAX_BYTES = CFG.MAX_FILE_MB * 1024 * 1024;
@@ -640,7 +622,6 @@ async function downloadFile(fileId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// ── Message splitter ──
 function splitSafely(text, maxLen = 4000) {
   const chunks = [];
   while (text.length > maxLen) {
@@ -660,7 +641,6 @@ async function sendLongMessage(chatId, text, opts = {}) {
   }
 }
 
-// ── Safe message sending ──
 async function safeSend(chatId, text, opts = {}) {
   if (text.length > 4000) return sendLongMessage(chatId, text, opts);
   try {
@@ -705,12 +685,10 @@ async function safeSend(chatId, text, opts = {}) {
   }
 }
 
-// ── Markdown escaping ──
 function escapeMarkdown(text) {
   return text.replace(/([_*`\[\]])/g, "\\$1");
 }
 
-// ── Markdown → Telegram HTML formatting ──
 function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -789,7 +767,6 @@ async function sendAIReply(chatId, header, reply, truncated, footerHtml) {
   }
 }
 
-// ── Thinking / status placeholder ────────────────────────
 async function withThinkingIndicator(chatId, label, fn) {
   let placeholder;
   try { placeholder = await bot.sendMessage(chatId, label); } catch { }
@@ -808,7 +785,6 @@ async function withThinkingIndicator(chatId, label, fn) {
   }
 }
 
-// ── Pro-model gating ──
 function checkProLimit(chatId, chosen) {
   if (chosen.id === "pro") {
     if (!checkLimit(chatId, "proTokens", CFG.PRO_LIMIT)) {
@@ -817,7 +793,6 @@ function checkProLimit(chatId, chosen) {
   }
 }
 
-// ── AI call ──
 async function callModel(chatId, chosen, promptText) {
   if (!chosen?.key) throw new Error("NO_KEY");
   checkProLimit(chatId, chosen);
@@ -876,7 +851,6 @@ async function callModel(chatId, chosen, promptText) {
   throw new Error("UNKNOWN_PROVIDER");
 }
 
-// ── Vision call (per provider) ──
 async function callVisionModel(chatId, chosen, base64Image, mimeType, instructionText) {
   if (!chosen?.key) throw new Error("NO_KEY");
   checkProLimit(chatId, chosen);
@@ -951,7 +925,6 @@ async function getAIReply(chatId, text, history, lang) {
   return callModel(chatId, chosen, prompt);
 }
 
-// ── Prefs hydration with dedup ────────────────────────────
 async function hydrateUserPrefs(chatId) {
   const key = cid(chatId);
   if (userLanguages.has(key) && userModels.has(key)) return;
@@ -972,7 +945,6 @@ async function hydrateUserPrefs(chatId) {
   return promise;
 }
 
-// ── Chat history helpers ──────────────────────────────────
 async function appendChatHistory(chatId, userText, botText, truncated = false) {
   const key = cid(chatId);
   const now = new Date();
@@ -1002,7 +974,6 @@ async function getRecentHistory(chatId) {
   return doc.messages.map(m => `${m.role}: ${m.text}`).join("\n");
 }
 
-// ── Broadcast ──
 async function broadcastMessage(message) {
   let success = 0, failed = 0;
   const DELAY = 220;
@@ -1019,7 +990,7 @@ async function broadcastMessage(message) {
 }
 
 // ============================================================
-//  SECTION 9 · STARTUP — wait for DB, THEN open for traffic
+//  STARTUP
 // ============================================================
 async function startup() {
   await connectDB();
@@ -1048,7 +1019,6 @@ async function startup() {
   console.log("🤖 Bot fully ready");
 }
 
-// ── Scheduled cleanup ─────────────────────────────────────
 async function runCleanup() {
   console.log(`🔧 Cleanup started [${new Date().toISOString()}]`);
   try {
@@ -1065,15 +1035,10 @@ async function runCleanup() {
 }
 
 // ============================================================
-//  SECTION 10 · BOT COMMANDS
+//  BOT COMMANDS
 // ============================================================
-
-// ── Command reply helpers ─────────────────────────────────
 const LINE = "━━━━━━━━━━━━━━";
 
-// Anchored command matcher: fires ONLY when the message STARTS with the command
-// ("/help", "/help@MyBot", "/help something"). A sentence that merely mentions
-// "/help" in the middle (e.g. "what does /help do?") goes to the AI instead.
 const cmd = (name) => new RegExp(`^\\/${name}(?:@\\w+)?(?:\\s|$)`, "i");
 
 function progressBar(used, limit, size = 10) {
@@ -1088,7 +1053,6 @@ function fmtDuration(ms) {
   return h > 0 ? `${h}h ${m % 60}m` : `${m}m`;
 }
 
-// ── /start ───────────────────────────────────────────────
 bot.onText(cmd("start"), async (msg) => {
   if (!await checkMembership(msg)) return;
   const uid = senderId(msg);
@@ -1108,10 +1072,6 @@ bot.onText(cmd("start"), async (msg) => {
   );
 });
 
-// ── /help ────────────────────────────────────────────────
-// HTML parse mode on purpose: legacy Markdown cannot escape "_" inside an italic
-// block, so a contact like "@my_channel" made Telegram reject the whole message and
-// the fallback showed raw *asterisks*. HTML has no such problem.
 bot.onText(cmd("help"), async (msg) => {
   if (!await checkMembership(msg)) return;
   const contact = escapeHtml(CFG.FORCE_CHANNEL || "the admin");
@@ -1134,7 +1094,6 @@ bot.onText(cmd("help"), async (msg) => {
   );
 });
 
-// ── /about ───────────────────────────────────────────────
 bot.onText(cmd("about"), async (msg) => {
   if (!await checkMembership(msg)) return;
   const models = Object.values(MODELS)
@@ -1155,7 +1114,6 @@ bot.onText(cmd("about"), async (msg) => {
   );
 });
 
-// ── /terms ───────────────────────────────────────────────
 bot.onText(cmd("terms"), async (msg) => {
   if (!await checkMembership(msg)) return;
   await safeReply(msg,
@@ -1178,7 +1136,6 @@ bot.onText(cmd("terms"), async (msg) => {
   );
 });
 
-// ── /status ──────────────────────────────────────────────
 bot.onText(cmd("status"), async (msg) => {
   const uid = senderId(msg);
 
@@ -1211,7 +1168,6 @@ bot.onText(cmd("status"), async (msg) => {
   );
 });
 
-// ── /clearchat ───────────────────────────────────────────
 bot.onText(cmd("clearchat"), async (msg) => {
   const uid = senderId(msg);
   if (!await checkMembership(msg)) return;
@@ -1227,7 +1183,6 @@ bot.onText(cmd("clearchat"), async (msg) => {
   }
 });
 
-// ── /account ─────────────────────────────────────────────
 bot.onText(cmd("account"), async (msg) => {
   const uid = senderId(msg);
   if (!await checkMembership(msg)) return;
@@ -1244,7 +1199,7 @@ bot.onText(cmd("account"), async (msg) => {
     await hydrateUserPrefs(uid);
     const lang = userLanguages.get(cid(uid)) || user.language || "en";
     const model = userModels.get(cid(uid)) || user.selectedModel || "gemini_1";
-    const usage = userUsage.get(cid(uid)) || {};
+    const usage = getUsageBucket(uid);
     const reset = new Date(); reset.setUTCHours(24, 0, 0, 0);
 
     await safeReply(msg,
@@ -1270,7 +1225,6 @@ bot.onText(cmd("account"), async (msg) => {
   }
 });
 
-// ── Keyboards (✅ marks the active choice) ────────────────
 function buildLanguageKeyboard(current) {
   const buttons = Object.entries(LANGUAGES).map(([code, name]) => ({
     text: code === current ? `✅ ${name}` : name,
@@ -1292,7 +1246,6 @@ function buildModelKeyboard(current) {
   });
 }
 
-// ── /language ────────────────────────────────────────────
 bot.onText(cmd("language"), async (msg) => {
   if (!await checkMembership(msg)) return;
   const uid = senderId(msg);
@@ -1305,7 +1258,6 @@ bot.onText(cmd("language"), async (msg) => {
   });
 });
 
-// ── /setmodel ────────────────────────────────────────────
 bot.onText(cmd("setmodel"), async (msg) => {
   if (!await checkMembership(msg)) return;
   const uid = senderId(msg);
@@ -1318,13 +1270,11 @@ bot.onText(cmd("setmodel"), async (msg) => {
   });
 });
 
-// ── Unified callback handler ──────────────────────────────
 bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const uid = query.from?.id ?? chatId;
   const data = query.data || "";
 
-  // Move the ✅ by editing the keyboard of the message that was tapped
   const refreshKeyboard = (keyboard) =>
     bot.editMessageReplyMarkup(
       { inline_keyboard: keyboard },
@@ -1401,7 +1351,6 @@ bot.on("callback_query", async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => { });
 });
 
-// ── Document analysis ─────────────────────────────────────
 bot.on("document", async (msg) => {
   const chatId = msg.chat.id;
   const uid = senderId(msg);
@@ -1498,7 +1447,6 @@ bot.on("document", async (msg) => {
   }
 });
 
-// ── Image analysis ────────────────────────────────────────
 bot.on("photo", async (msg) => {
   const chatId = msg.chat.id;
   const uid = senderId(msg);
@@ -1582,7 +1530,6 @@ bot.on("photo", async (msg) => {
   }
 });
 
-// ── Shared AI-reply pipeline ──────────────────────────────
 const LEGACY_BUTTONS = new Set(["🔍 Search", "🎨 Imagine", "🚫 Report Error", "📄 Document Analysis"]);
 
 async function runAiPipeline(msg, text) {
@@ -1661,7 +1608,6 @@ async function runAiPipeline(msg, text) {
   }
 }
 
-// ── Main chat handler (private chat) ──────────────────────
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -1689,10 +1635,8 @@ bot.on("message", async (msg) => {
 });
 
 // ============================================================
-//  SECTION 11 · ADMIN COMMANDS
+//  ADMIN COMMANDS
 // ============================================================
-
-// ── /admin ── admin command list (silently ignored for everyone else) ──
 bot.onText(/^\/admin(?:@\w+)?\s*$/, async (msg) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
   await safeSend(CFG.ADMIN_ID,
@@ -1716,12 +1660,22 @@ bot.onText(/^\/admin(?:@\w+)?\s*$/, async (msg) => {
   );
 });
 
-// ── /broadcast ───────────────────────────────────────────
-bot.onText(/^\/broadcast(?:@\w+)?\s+([\s\S]+)$/i, async (msg, match) => {
+bot.onText(/^\/broadcast(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
+
+  const message = (match[1] || "").trim();
+  if (!message) {
+    return bot.sendMessage(CFG.ADMIN_ID,
+      `⚠️ Usage: /broadcast <message>\n\n` +
+      `Example:\n` +
+      `/broadcast Maintenance tonight at 10 PM UTC\n\n` +
+      `Sends the message to every non-banned user in the database.`
+    ).catch(() => { });
+  }
+
   bot.sendMessage(CFG.ADMIN_ID, "📡 Broadcast starting…").catch(() => { });
   try {
-    const { success, failed } = await broadcastMessage(match[1]);
+    const { success, failed } = await broadcastMessage(message);
     bot.sendMessage(CFG.ADMIN_ID, `✅ Done.\n✔️ Sent: ${success}\n❌ Failed: ${failed}`).catch(() => { });
   } catch (err) {
     console.error("broadcast error:", err.message);
@@ -1729,7 +1683,6 @@ bot.onText(/^\/broadcast(?:@\w+)?\s+([\s\S]+)$/i, async (msg, match) => {
   }
 });
 
-// ── /usage ── single aggregated daily summary ────────────
 bot.onText(cmd("usage"), async (msg) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
   try {
@@ -1756,7 +1709,6 @@ bot.onText(cmd("usage"), async (msg) => {
   }
 });
 
-// ── /users ───────────────────────────────────────────────
 bot.onText(cmd("users"), async (msg) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
   try {
@@ -1775,7 +1727,6 @@ bot.onText(cmd("users"), async (msg) => {
   }
 });
 
-// ── /approve <id> [hours] ────────────────────────────────
 const MAX_APPROVAL_HOURS = 24 * 365;
 
 bot.onText(/^\/approve(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
@@ -1788,10 +1739,13 @@ bot.onText(/^\/approve(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   if (!/^\d+$/.test(userId || "") || extra.length || !hoursOk || !(hours > 0) || hours > MAX_APPROVAL_HOURS) {
     return bot.sendMessage(CFG.ADMIN_ID,
       `⚠️ Usage: /approve <id> [hours]\n\n` +
-      `/approve 123456789       → ${CFG.APPROVAL_HOURS}h (default)\n` +
-      `/approve 123456789 72    → 72 hours\n` +
-      `/approve 123456789 0.5   → 30 minutes\n\n` +
-      `Max: ${MAX_APPROVAL_HOURS} hours.`
+      `• <id> — numeric Telegram user id (required)\n` +
+      `• [hours] — access duration, optional (default ${CFG.APPROVAL_HOURS}h, max ${MAX_APPROVAL_HOURS}h)\n\n` +
+      `Examples:\n` +
+      `/approve 123456789 → ${CFG.APPROVAL_HOURS} hours (default)\n` +
+      `/approve 123456789 72 → 72 hours\n` +
+      `/approve 123456789 0.5 → 30 minutes\n\n` +
+      `Approving a user again replaces their current expiry.`
     ).catch(() => { });
   }
 
@@ -1817,22 +1771,31 @@ bot.onText(/^\/approve(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   }
 });
 
-// ── /remove <id> ─────────────────────────────────────────
-bot.onText(/^\/remove(?:@\w+)?\s+(\d+)\s*$/i, async (msg, match) => {
+bot.onText(/^\/remove(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
-  const userId = match[1];
+
+  const userId = (match[1] || "").trim();
+  if (!/^\d+$/.test(userId)) {
+    return bot.sendMessage(CFG.ADMIN_ID,
+      `⚠️ Usage: /remove <id>\n\n` +
+      `Example:\n` +
+      `/remove 123456789\n\n` +
+      `Revokes the user's approved access. Use /users to see approved ids.`
+    ).catch(() => { });
+  }
+
   try {
-    await User.findOneAndUpdate({ chatId: userId }, { $set: { approvedUntil: null } });
+    const res = await User.findOneAndUpdate({ chatId: userId }, { $set: { approvedUntil: null } });
     approvalCache.delete(userId);
-    bot.sendMessage(CFG.ADMIN_ID, `❌ User ${userId} removed.`).catch(() => { });
+    bot.sendMessage(CFG.ADMIN_ID,
+      res ? `❌ User ${userId} removed.` : `ℹ️ User ${userId} isn't in the database.`
+    ).catch(() => { });
   } catch (err) {
     console.error("remove error:", err.message);
     bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not remove user.").catch(() => { });
   }
 });
 
-// ── /ban <id> [reason] ───────────────────────────────────
-// Banned users are dropped silently in the webhook, so nothing they send is processed.
 bot.onText(/^\/ban(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
 
@@ -1862,7 +1825,6 @@ bot.onText(/^\/ban(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   }
 });
 
-// ── /unban <id> ──────────────────────────────────────────
 bot.onText(/^\/unban(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
 
@@ -1887,7 +1849,6 @@ bot.onText(/^\/unban(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
   }
 });
 
-// ── /banned ── list banned users ─────────────────────────
 bot.onText(cmd("banned"), async (msg) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
   try {
@@ -1904,7 +1865,6 @@ bot.onText(cmd("banned"), async (msg) => {
   }
 });
 
-// ── /public / /private / /mode — persisted to DB ──
 bot.onText(cmd("public"), async (msg) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
   try {
@@ -1934,8 +1894,6 @@ bot.onText(cmd("mode"), (msg) => {
   bot.sendMessage(CFG.ADMIN_ID, PUBLIC_MODE ? "🔓 Mode: PUBLIC" : "🔒 Mode: PRIVATE").catch(() => { });
 });
 
-// ============================================================
-// ============================================================
 startup().catch(err => {
   console.error("❌ Fatal startup error:", err.message);
   process.exit(1);
