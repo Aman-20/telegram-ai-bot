@@ -926,15 +926,6 @@ async function getAIReply(chatId, text, history, lang) {
   return callModel(chatId, chosen, prompt, system);
 }
 
-// ---- Provider / pipeline error handling ----
-const adminAlertAt = new Map();
-function alertAdmin(key, text) {
-  const now = Date.now();
-  if (now - (adminAlertAt.get(key) || 0) < 30 * 60 * 1000) return; // max one alert per 30 min per issue
-  adminAlertAt.set(key, now);
-  bot.sendMessage(CFG.ADMIN_ID, text).catch(() => { });
-}
-
 function userErrorText(err, kind) {
   const m = err?.message || "";
   if (m === "QUEUE_FULL") return "⚠️ Bot is busy. Please try again in a moment.";
@@ -981,13 +972,6 @@ async function failureReply(msg, err, kind) {
       `❌ ${kind} provider error [${err.provider}/${err.model}] ${err.code}${err.status ? ` (HTTP ${err.status})` : ""}:`,
       redact(err.message).slice(0, 300)
     );
-    if (err.code === "AUTH" || err.code === "NOT_FOUND" || err.code === "NO_KEY") {
-      alertAdmin(
-        `${err.provider}:${err.model}:${err.code}`,
-        `⚠️ Model problem: ${err.provider} / ${err.model} → ${err.code}${err.status ? ` (HTTP ${err.status})` : ""}\n` +
-        `${redact(err.message).slice(0, 200)}\n\nCheck the API key or model name (/models, /testmodel <id>).`
-      );
-    }
   } else {
     console.error(`❌ ${kind} error:`, redact(err?.message || err));
   }
