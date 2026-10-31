@@ -1,14 +1,15 @@
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import mongoose from "mongoose";
 import fetch from "node-fetch";
-import OpenAI from "openai";
-import Anthropic from "@anthropic-ai/sdk";
 import { createRequire } from "module";
 import dns from "node:dns";
 import net from "node:net";
+import { PROVIDERS, providerKey } from "./config/providers.js";
+import * as registry from "./services/modelRegistry.js";
+import { generate, generateWithImage } from "./providers/index.js";
+import { ProviderError } from "./providers/errors.js";
 
 const require = createRequire(import.meta.url);
 const mammoth = require("mammoth");
@@ -63,8 +64,6 @@ const CFG = {
   DOC_LIMIT: Number(process.env.LIMIT_DOC_ANALYSIS) || 5,
   IMG_LIMIT: Number(process.env.LIMIT_IMG_ANALYSIS) || 10,
   PRO_LIMIT: Number(process.env.LIMIT_PRO_MODEL) || 10,
-  PRO_PROVIDER: (process.env.PRO_PROVIDER || "gemini").toLowerCase(),
-  PRO_MODEL_NAME: process.env.PRO_MODEL_NAME || "",
   DOC_CHAR_LIMIT: Number(process.env.DOC_CHAR_LIMIT) || 10000,
   MAX_HISTORY_CHARS: Number(process.env.MAX_HISTORY_CHARS) || 500,
   RATE_LIMIT_MS: (Number(process.env.RATE_LIMIT_MS) || 3) * 1000,
@@ -85,9 +84,6 @@ const CFG = {
 
   API_TIMEOUT_MS: Number(process.env.API_TIMEOUT_MS) || 90000,
 
-  GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
-  CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
 };
 
 function validateEnv() {
@@ -104,10 +100,6 @@ function validateEnv() {
     process.exit(1);
   }
 
-  if (!CFG.GEMINI_API_KEY && !CFG.OPENAI_API_KEY && !CFG.CLAUDE_API_KEY) {
-    console.warn("⚠️ No AI provider key set (GEMINI_API_KEY / OPENAI_API_KEY / CLAUDE_API_KEY). " +
-      "Every chat, document, and image request will fail until at least one is configured.");
-  }
 }
 validateEnv();
 
@@ -194,7 +186,7 @@ const userSchema = new mongoose.Schema(
   {
     chatId: { type: String, required: true, unique: true },
     approvedUntil: { type: Date, default: null },
-    selectedModel: { type: String, default: "gemini_1" },
+    selectedModel: { type: String, default: "" },
     language: { type: String, default: "en" },
     requests: { type: Number, default: 0 },
     lastReset: { type: Date, default: () => new Date() },
@@ -323,48 +315,6 @@ async function enqueueRequest(fn) {
 // ============================================================
 //  AI MODELS
 // ============================================================
-function buildProModelEntry() {
-  const provider = CFG.PRO_PROVIDER;
-  const keyByProvider = {
-    gemini: CFG.GEMINI_API_KEY,
-    openai: CFG.OPENAI_API_KEY,
-    claude: CFG.CLAUDE_API_KEY,
-  };
-  return {
-    id: "pro",
-    name: CFG.PRO_MODEL_NAME,
-    key: keyByProvider[provider],
-    provider,
-    model: CFG.PRO_MODEL_NAME,
-  };
-}
-
-const MODELS = {
-  gemini_1: { id: "gemini_1", name: process.env.GEMINI_MODEL_1, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_1 },
-  gemini_2: { id: "gemini_2", name: process.env.GEMINI_MODEL_2, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_2 },
-  gemini_3: { id: "gemini_3", name: process.env.GEMINI_MODEL_3, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_3 },
-  gemini_4: { id: "gemini_4", name: process.env.GEMINI_MODEL_4, key: process.env.GEMINI_API_KEY, provider: "gemini", model: process.env.GEMINI_MODEL_4 },
-  openai: { id: "openai", name: process.env.OPENAI_MODEL_1, key: process.env.OPENAI_API_KEY, provider: "openai", model: process.env.OPENAI_MODEL_1 },
-  claude: { id: "claude", name: process.env.CLAUDE_MODEL_1, key: process.env.CLAUDE_API_KEY, provider: "claude", model: process.env.CLAUDE_MODEL_1 },
-};
-
-if (CFG.PRO_MODEL_NAME) {
-  MODELS.pro = buildProModelEntry();
-}
-
-const genAI = new GoogleGenerativeAI(CFG.GEMINI_API_KEY || "");
-
-let _openai = null;
-let _anthropic = null;
-function getOpenAI() {
-  if (!CFG.OPENAI_API_KEY) throw new Error("NO_KEY");
-  return (_openai ??= new OpenAI({ apiKey: CFG.OPENAI_API_KEY }));
-}
-function getAnthropic() {
-  if (!CFG.CLAUDE_API_KEY) throw new Error("NO_KEY");
-  return (_anthropic ??= new Anthropic({ apiKey: CFG.CLAUDE_API_KEY }));
-}
-
 const LANGUAGES = {
   en: "🇬🇧 English", hi: "🇮🇳 Hindi", es: "🇪🇸 Spanish",
   fr: "🇫🇷 French", de: "🇩🇪 German", ja: "🇯🇵 Japanese",
@@ -450,6 +400,7 @@ bot.setMyCommands([
   { command: "language", description: "🌐 Change language" },
   { command: "setmodel", description: "🤖 Select AI model" },
   { command: "clearchat", description: "🧹 Clear chat history" },
+  { command: "admin", description: "💰 Admin Commands" },
 ]).catch(() => { });
 
 // ============================================================
@@ -502,14 +453,22 @@ async function commitLimit(chatId, type) {
   await bumpStats({ [type]: 1 });
 }
 
-// Picks the user's chosen model; falls back to the first model that has BOTH a key and a name
-function usableModels() {
-  return Object.values(MODELS).filter(m => m.key && m.name);
-}
+const NO_MODEL_TEXT = "⚠️ No AI model is available right now. Please contact the admin.";
+
+// Returns the user's chosen model. No silent fallback: if the chosen model is gone, they must pick again.
 function resolveModel(selectedId) {
-  const m = MODELS[selectedId];
-  if (m?.key && m?.name) return m;
-  return usableModels()[0] || m || MODELS.gemini_1;
+  const usable = registry.usableModels();
+  if (!usable.length) throw new Error("NO_MODEL");
+  if (!selectedId) return usable[0]; // user never chose one → first available
+  const m = usable.find(x => x.id === selectedId);
+  if (!m) throw new Error("MODEL_UNAVAILABLE");
+  return m;
+}
+
+async function guardModels(msg) {
+  if (registry.usableModels().length) return true;
+  await safeReply(msg, NO_MODEL_TEXT);
+  return false;
 }
 
 async function isUserMember(chatId) {
@@ -694,7 +653,7 @@ async function finalizeUsage(chatId, user, inputTokens, reply, chosen, realTotal
 
   const remaining = Math.max(0, CFG.DAILY_REQUEST_LIMIT - (user.requests + 1));
   const tokLeft = Math.max(0, CFG.DAILY_TOKEN_LIMIT - newTotal);
-  return `\n\n🤖 <b>${escapeHtml(chosen.name || "")}</b>  |  📨 ${remaining} left  |  🪙 ${tokLeft} tokens`;
+  return `\n\n🤖 <b>${escapeHtml(chosen.label || chosen.id || "")}</b>  |  📨 ${remaining} left  |  🪙 ${tokLeft} tokens`;
 }
 
 async function downloadFile(fileId) {
@@ -930,171 +889,109 @@ async function withThinkingIndicator(chatId, label, fn) {
 
 // Pro quota: checked before the call, but only charged after the call succeeds
 async function checkProLimit(chatId, chosen) {
-  if (chosen.id === "pro" && !(await hasQuotaLeft(chatId, "pro", CFG.PRO_LIMIT))) {
+  if (chosen.tier === "pro" && !(await hasQuotaLeft(chatId, "pro", CFG.PRO_LIMIT))) {
     throw new Error(`PRO_LIMIT:${CFG.PRO_LIMIT}`);
   }
 }
 async function countProUse(chatId, chosen) {
-  if (chosen.id === "pro") {
+  if (chosen.tier === "pro") {
     await incUsage(chatId, "pro").catch(e => console.error("❌ pro usage error:", e.message));
   }
 }
 
-// response.text() throws when Gemini blocks the response (safety etc.)
-function geminiText(result) {
-  const r = result?.response;
-  try { return r?.text() || ""; }
-  catch {
-    const why = r?.promptFeedback?.blockReason || r?.candidates?.[0]?.finishReason;
-    return `⚠️ Gemini refused to answer this${why ? ` (${why})` : ""}. Try rephrasing your request.`;
-  }
-}
-
-async function callModel(chatId, chosen, promptText) {
-  if (!chosen?.key) throw new Error("NO_KEY");
+async function callModel(chatId, chosen, promptText, system = "") {
   await checkProLimit(chatId, chosen);
-  const out = await callModelRaw(chosen, promptText);
+  const out = await generate(chosen, {
+    system, prompt: promptText, maxTokens: CFG.MAX_REPLY_TOKENS, timeoutMs: CFG.API_TIMEOUT_MS,
+  });
   await countProUse(chatId, chosen);
-  return out;
-}
-
-async function callModelRaw(chosen, promptText) {
-  if (chosen.provider === "gemini") {
-    const model = genAI.getGenerativeModel({ model: chosen.model });
-    const result = await withTimeout(
-      model.generateContent({
-        contents: [{ role: "user", parts: [{ text: promptText }] }],
-        generationConfig: { maxOutputTokens: CFG.MAX_REPLY_TOKENS },
-      }),
-      CFG.API_TIMEOUT_MS, "gemini"
-    );
-    return {
-      reply: geminiText(result) || "⚠️ No response from Gemini (the model may have used its whole token budget on thinking).",
-      chosen,
-      truncated: result?.response?.candidates?.[0]?.finishReason === "MAX_TOKENS",
-      totalTokens: result?.response?.usageMetadata?.totalTokenCount,
-    };
-  }
-
-  if (chosen.provider === "openai") {
-    const result = await withTimeout(
-      getOpenAI().chat.completions.create({
-        model: chosen.model,
-        messages: [
-          { role: "system", content: "You are a helpful assistant." },
-          { role: "user", content: promptText },
-        ],
-        max_completion_tokens: CFG.MAX_REPLY_TOKENS,
-      }),
-      CFG.API_TIMEOUT_MS, "openai"
-    );
-    return {
-      reply: result.choices[0].message.content || "⚠️ No response from OpenAI (the model may have used its whole token budget on reasoning).",
-      chosen,
-      truncated: result.choices[0].finish_reason === "length",
-      totalTokens: result.usage?.total_tokens,
-    };
-  }
-
-  if (chosen.provider === "claude") {
-    const result = await withTimeout(
-      getAnthropic().messages.create({
-        model: chosen.model,
-        max_tokens: CFG.MAX_REPLY_TOKENS,
-        messages: [{ role: "user", content: promptText }],
-      }),
-      CFG.API_TIMEOUT_MS, "claude"
-    );
-    return {
-      reply: result.content?.find(b => b.type === "text")?.text || "⚠️ No response from Claude.",
-      chosen,
-      truncated: result.stop_reason === "max_tokens",
-      totalTokens: (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
-    };
-  }
-
-  throw new Error("UNKNOWN_PROVIDER");
+  return { ...out, chosen };
 }
 
 async function callVisionModel(chatId, chosen, base64Image, mimeType, instructionText) {
-  if (!chosen?.key) throw new Error("NO_KEY");
+  if (!chosen.vision) throw new Error("NO_VISION");
   await checkProLimit(chatId, chosen);
-  const out = await callVisionModelRaw(chosen, base64Image, mimeType, instructionText);
+  const out = await generateWithImage(chosen, {
+    prompt: instructionText, base64Image, mimeType,
+    maxTokens: CFG.MAX_REPLY_TOKENS, timeoutMs: CFG.API_TIMEOUT_MS,
+  });
   await countProUse(chatId, chosen);
-  return out;
-}
-
-async function callVisionModelRaw(chosen, base64Image, mimeType, instructionText) {
-  if (chosen.provider === "gemini") {
-    const model = genAI.getGenerativeModel({ model: chosen.model });
-    const result = await withTimeout(
-      model.generateContent([
-        instructionText,
-        { inlineData: { data: base64Image, mimeType } },
-      ]),
-      CFG.API_TIMEOUT_MS, "gemini-img"
-    );
-    return {
-      reply: geminiText(result) || "⚠️ No response from Gemini (the model may have used its whole token budget on thinking).",
-      chosen,
-      truncated: result?.response?.candidates?.[0]?.finishReason === "MAX_TOKENS",
-      totalTokens: result?.response?.usageMetadata?.totalTokenCount,
-    };
-  }
-
-  if (chosen.provider === "openai") {
-    const result = await withTimeout(
-      getOpenAI().chat.completions.create({
-        model: chosen.model,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "text", text: instructionText },
-            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } },
-          ],
-        }],
-        max_completion_tokens: CFG.MAX_REPLY_TOKENS,
-      }),
-      CFG.API_TIMEOUT_MS, "openai-img"
-    );
-    return {
-      reply: result.choices[0].message.content || "⚠️ No response from OpenAI (the model may have used its whole token budget on reasoning).",
-      chosen,
-      truncated: result.choices[0].finish_reason === "length",
-      totalTokens: result.usage?.total_tokens,
-    };
-  }
-
-  if (chosen.provider === "claude") {
-    const result = await withTimeout(
-      getAnthropic().messages.create({
-        model: chosen.model,
-        max_tokens: CFG.MAX_REPLY_TOKENS,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: mimeType, data: base64Image } },
-            { type: "text", text: instructionText },
-          ],
-        }],
-      }),
-      CFG.API_TIMEOUT_MS, "claude-img"
-    );
-    return {
-      reply: result.content?.find(b => b.type === "text")?.text || "⚠️ No response from Claude.",
-      chosen,
-      truncated: result.stop_reason === "max_tokens",
-      totalTokens: (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
-    };
-  }
-
-  throw new Error("UNKNOWN_PROVIDER");
+  return { ...out, chosen };
 }
 
 async function getAIReply(chatId, text, history, lang) {
-  const chosen = resolveModel(userModels.get(cid(chatId)) || "gemini_1");
-  const prompt = `Answer in ${langLabel(lang)}.\n${CFG.STYLE_PROMPT}\n\nConversation so far:\n${history}\n\nUser: ${text}`;
-  return callModel(chatId, chosen, prompt);
+  const chosen = resolveModel(userModels.get(cid(chatId)));
+  const system = `Answer in ${langLabel(lang)}.\n${CFG.STYLE_PROMPT}`;
+  const prompt = history ? `Conversation so far:\n${history}\n\nUser: ${text}` : text;
+  return callModel(chatId, chosen, prompt, system);
+}
+
+// ---- Provider / pipeline error handling ----
+const adminAlertAt = new Map();
+function alertAdmin(key, text) {
+  const now = Date.now();
+  if (now - (adminAlertAt.get(key) || 0) < 30 * 60 * 1000) return; // max one alert per 30 min per issue
+  adminAlertAt.set(key, now);
+  bot.sendMessage(CFG.ADMIN_ID, text).catch(() => { });
+}
+
+function userErrorText(err, kind) {
+  const m = err?.message || "";
+  if (m === "QUEUE_FULL") return "⚠️ Bot is busy. Please try again in a moment.";
+  if (m === "DAILY_REQUEST_LIMIT") return `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`;
+  if (m === "DAILY_TOKEN_LIMIT") return `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`;
+  if (m.startsWith("PRO_LIMIT")) return "⚠️ Pro model daily limit reached. Please switch to another model using /setmodel.";
+  if (m === "NO_MODEL") return NO_MODEL_TEXT;
+  if (m === "MODEL_UNAVAILABLE") return "⚠️ Your selected model is no longer available. Please choose another one using /setmodel.";
+  if (m === "NO_VISION") return "⚠️ This model can't analyse images. Please switch to a model that supports images (🖼) using /setmodel.";
+  if (m.startsWith("FILE_TOO_LARGE") || /file is too big/i.test(m)) return `⚠️ File too large. Max: ${CFG.MAX_FILE_MB} MB.`;
+
+  switch (err?.code) {
+    case "HIGH_DEMAND":
+      return "⚠️ This model is experiencing high demand right now. Please switch to another model using /setmodel and try again.";
+    case "TIMEOUT":
+      return "⚠️ The model took too long to respond. Try again, or switch to another model using /setmodel.";
+    case "NETWORK":
+      return "⚠️ Couldn't reach the model provider. Try again shortly, or switch to another model using /setmodel.";
+    case "BLOCKED":
+      return "⚠️ The model couldn't answer this request. Try rephrasing it, or switch to another model using /setmodel.";
+    case "EMPTY":
+      return "⚠️ The model returned an empty answer. Try again, or switch to another model using /setmodel.";
+    case "AUTH":
+    case "NOT_FOUND":
+    case "NO_KEY":
+      return "⚠️ This model is currently unavailable. Please switch to another model using /setmodel.";
+    case "BAD_REQUEST":
+      return "⚠️ The model rejected this request (it may be too long). Try something shorter, or switch model using /setmodel.";
+  }
+
+  if (m.startsWith("TIMEOUT")) {
+    return kind === "document" ? "⚠️ Analysis timed out. Try a smaller file."
+      : kind === "image" ? "⚠️ Analysis timed out. Try a smaller image."
+        : "⚠️ Took too long to respond. Try again.";
+  }
+  return kind === "document" ? "⚠️ Could not analyse your document."
+    : kind === "image" ? "⚠️ Could not analyse your image."
+      : "❌ Something went wrong. Please try again.";
+}
+
+async function failureReply(msg, err, kind) {
+  if (err instanceof ProviderError) {
+    console.error(
+      `❌ ${kind} provider error [${err.provider}/${err.model}] ${err.code}${err.status ? ` (HTTP ${err.status})` : ""}:`,
+      redact(err.message).slice(0, 300)
+    );
+    if (err.code === "AUTH" || err.code === "NOT_FOUND" || err.code === "NO_KEY") {
+      alertAdmin(
+        `${err.provider}:${err.model}:${err.code}`,
+        `⚠️ Model problem: ${err.provider} / ${err.model} → ${err.code}${err.status ? ` (HTTP ${err.status})` : ""}\n` +
+        `${redact(err.message).slice(0, 200)}\n\nCheck the API key or model name (/models, /testmodel <id>).`
+      );
+    }
+  } else {
+    console.error(`❌ ${kind} error:`, redact(err?.message || err));
+  }
+  await safeReply(msg, userErrorText(err, kind));
 }
 
 async function hydrateUserPrefs(chatId) {
@@ -1105,11 +1002,11 @@ async function hydrateUserPrefs(chatId) {
   const promise = User.findOne({ chatId: key }, { language: 1, selectedModel: 1 })
     .then(u => {
       if (!userLanguages.has(key)) userLanguages.set(key, u?.language || "en");
-      if (!userModels.has(key)) userModels.set(key, u?.selectedModel || "gemini_1");
+      if (!userModels.has(key)) userModels.set(key, u?.selectedModel || "");
     })
     .catch(() => {
       userLanguages.set(key, "en");
-      userModels.set(key, "gemini_1");
+      userModels.set(key, "");
     })
     .finally(() => _prefsPending.delete(key));
 
@@ -1185,6 +1082,11 @@ async function startup() {
 
   await connectDB(); // retries until connected, so publicMode below is always loaded
 
+  await registry.init();
+  const usableCount = registry.usableModels().length;
+  console.log(`🧠 Models: ${usableCount} usable / ${registry.listModels().length} total`);
+  if (!usableCount) console.warn("⚠️ No usable AI model (missing API keys, disabled, or none added). Users will see 'no model available'.");
+
   for (let i = 1; i <= 3; i++) {
     try {
       const s = await Setting.findOne({ key: "publicMode" });
@@ -1255,7 +1157,7 @@ bot.onText(cmd("start"), async (msg) => {
   // If they had blocked the bot before, they're back
   User.updateOne({ chatId: cid(uid) }, { $set: { blocked: false } }).catch(() => { });
   const key = cid(uid);
-  if (!userModels.has(key)) userModels.set(key, "gemini_1");
+  if (!userModels.has(key)) userModels.set(key, "");
   if (!userLanguages.has(key)) userLanguages.set(key, "en");
 
   await safeSend(msg.chat.id,
@@ -1292,9 +1194,8 @@ bot.onText(cmd("help"), async (msg) => {
 
 bot.onText(cmd("about"), async (msg) => {
   if (!await checkMembership(msg)) return;
-  const models = Object.values(MODELS)
-    .filter(m => m.key && m.name)
-    .map(m => `• ${escapeMarkdown(m.name)}`)
+  const models = registry.usableModels()
+    .map(m => `• ${escapeMarkdown(m.label)}`)
     .join("\n");
 
   await safeReply(msg,
@@ -1394,7 +1295,7 @@ bot.onText(cmd("account"), async (msg) => {
 
     await hydrateUserPrefs(uid);
     const lang = userLanguages.get(cid(uid)) || user.language || "en";
-    const model = userModels.get(cid(uid)) || user.selectedModel || "gemini_1";
+    const model = userModels.get(cid(uid)) || user.selectedModel || "";
     const usage = await getUsage(uid);
     const reset = new Date(); reset.setUTCHours(24, 0, 0, 0);
 
@@ -1409,10 +1310,10 @@ bot.onText(cmd("account"), async (msg) => {
       `📁 *Files Today*\n` +
       `Documents — ${usage.doc || 0} / ${CFG.DOC_LIMIT}\n` +
       `Photos — ${usage.img || 0} / ${CFG.IMG_LIMIT}\n` +
-      (MODELS.pro ? `Pro model — ${usage.pro || 0} / ${CFG.PRO_LIMIT}\n` : ``) +
+      (registry.hasTier("pro") ? `Pro model — ${usage.pro || 0} / ${CFG.PRO_LIMIT}\n` : ``) +
       `\n⚙️ *Preferences*\n` +
       `Language — ${LANGUAGES[lang] || lang}\n` +
-      `Model — ${escapeMarkdown(MODELS[model]?.name || model)}`,
+      `Model — ${escapeMarkdown(registry.getModel(model)?.label || model || "default")}`,
       { parse_mode: "Markdown" }
     );
   } catch (err) {
@@ -1432,14 +1333,13 @@ function buildLanguageKeyboard(current) {
 }
 
 function buildModelKeyboard(current) {
-  // Skip entries with no model name (env var not set): empty button text makes Telegram reject the keyboard
-  return Object.entries(MODELS).filter(([, m]) => m.name).map(([id, m]) => {
-    let label = id === "pro" ? `${m.name} ⭐ Pro` : m.name;
-    if (id === current) label = `✅ ${label}`;
-    return [{
-      text: m.key ? label : `${label} ❌`,
-      callback_data: m.key ? `model_${id}` : `unavailable_${id}`,
-    }];
+  const usable = registry.usableModels();
+  const active = current || usable[0]?.id;
+  // One model per row. ⭐ = pro, 🖼 = can read images
+  return usable.map(m => {
+    let label = `${m.tier === "pro" ? "⭐ " : ""}${m.label}${m.vision ? " 🖼" : ""}`;
+    if (m.id === active) label = `✅ ${label}`;
+    return [{ text: label, callback_data: `model_${m.id}` }];
   });
 }
 
@@ -1459,7 +1359,9 @@ bot.onText(cmd("setmodel"), async (msg) => {
   if (!await checkMembership(msg)) return;
   const uid = senderId(msg);
   await hydrateUserPrefs(uid);
-  const current = userModels.get(cid(uid)) || "gemini_1";
+  const current = userModels.get(cid(uid)) || "";
+
+  if (!registry.usableModels().length) return safeReply(msg, NO_MODEL_TEXT);
 
   await safeReply(msg, `🧠 *Select AI Model*`, {
     parse_mode: "Markdown",
@@ -1521,12 +1423,12 @@ bot.on("callback_query", async (query) => {
 
   if (data.startsWith("model_")) {
     const modelId = data.slice(6);
-    if (!MODELS[modelId]?.key || !MODELS[modelId]?.name) {
+    if (!registry.getUsable(modelId)) {
       bot.answerCallbackQuery(query.id, { text: "⚠️ Model not available.", show_alert: true }).catch(() => { });
       return;
     }
     await hydrateUserPrefs(uid);
-    const current = userModels.get(cid(uid)) || "gemini_1";
+    const current = userModels.get(cid(uid)) || "";
 
     if (modelId === current) {
       bot.answerCallbackQuery(query.id, { text: "Already using this model" }).catch(() => { });
@@ -1574,6 +1476,7 @@ bot.on("document", async (msg) => {
   const uid = senderId(msg);
   if (!await checkMembership(msg)) return;
   if (!await guardAccess(msg)) return;
+  if (!await guardModels(msg)) return;
   if (!await guardRateLimitMedia(msg)) return;
   if (isProcessing(uid)) {
     return safeReply(msg, "⏳ Your previous request is still in progress.");
@@ -1624,7 +1527,7 @@ bot.on("document", async (msg) => {
 
         await hydrateUserPrefs(uid);
         const lang = userLanguages.get(cid(uid)) || "en";
-        const chosen = resolveModel(userModels.get(cid(uid)) || "gemini_1");
+        const chosen = resolveModel(userModels.get(cid(uid)) || "");
 
         const langName = langLabel(lang);
         const prompt = caption
@@ -1649,23 +1552,7 @@ bot.on("document", async (msg) => {
       });
     });
   } catch (err) {
-    console.error("❌ Document error:", redact(err.message));
-    await safeReply(msg, err.message === "QUEUE_FULL"
-      ? "⚠️ Bot is busy. Please try again in a moment."
-      : err.message === "DAILY_REQUEST_LIMIT"
-        ? `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`
-        : err.message === "DAILY_TOKEN_LIMIT"
-          ? `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`
-          : err.message?.startsWith("PRO_LIMIT")
-            ? "⚠️ Pro model daily limit reached. Use /setmodel."
-            : err.message === "NO_KEY"
-              ? "⚠️ Model unavailable. Use /setmodel."
-              : err.message?.startsWith("TIMEOUT")
-                ? "⚠️ Analysis timed out. Try a smaller file."
-                : err.message?.toLowerCase().includes("file is too big")
-                  ? `⚠️ File too large. Max: ${CFG.MAX_FILE_MB} MB.`
-                  : "⚠️ Could not analyse your document."
-    );
+    await failureReply(msg, err, "document");
   } finally {
     unmarkProcessing(uid);
   }
@@ -1683,6 +1570,7 @@ bot.on("photo", async (msg) => {
 
   if (!await checkMembership(msg)) return;
   if (!await guardAccess(msg)) return;
+  if (!await guardModels(msg)) return;
   if (!await guardRateLimitMedia(msg)) return;
   if (isProcessing(uid)) {
     return safeReply(msg, "⏳ Your previous request is still in progress.");
@@ -1712,7 +1600,7 @@ bot.on("photo", async (msg) => {
 
         await hydrateUserPrefs(uid);
         const lang = userLanguages.get(cid(uid)) || "en";
-        const chosen = resolveModel(userModels.get(cid(uid)) || "gemini_1");
+        const chosen = resolveModel(userModels.get(cid(uid)) || "");
         const langName = langLabel(lang);
         const instruction = caption
           ? `The user sent this image with a question or instruction. Answer it based on the image. Answer in ${langName}.\n${CFG.STYLE_PROMPT}\n\nUser's question: ${caption}`
@@ -1732,23 +1620,7 @@ bot.on("photo", async (msg) => {
       });
     });
   } catch (err) {
-    console.error("❌ Image analysis error:", redact(err.message));
-    await safeReply(msg, err.message === "QUEUE_FULL"
-      ? "⚠️ Bot is busy. Please try again in a moment."
-      : err.message === "DAILY_REQUEST_LIMIT"
-        ? `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`
-        : err.message === "DAILY_TOKEN_LIMIT"
-          ? `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`
-          : err.message?.startsWith("PRO_LIMIT")
-            ? "⚠️ Pro model daily limit reached. Use /setmodel."
-            : err.message === "NO_KEY"
-              ? "⚠️ Model unavailable. Use /setmodel."
-              : err.message?.startsWith("TIMEOUT")
-                ? "⚠️ Analysis timed out. Try a smaller image."
-                : err.message?.toLowerCase().includes("file is too big")
-                  ? `⚠️ Image too large. Max: ${CFG.MAX_FILE_MB} MB.`
-                  : "⚠️ Could not analyse your image."
-    );
+    await failureReply(msg, err, "image");
   } finally {
     unmarkProcessing(uid);
   }
@@ -1762,6 +1634,7 @@ async function runAiPipeline(msg, text) {
 
   if (!await checkMembership(msg)) return;
   if (!await guardAccess(msg)) return;
+  if (!await guardModels(msg)) return;
   if (!await guardRateLimit(msg)) return;
 
   if (/^https?:\/\//i.test(text.trim())) {
@@ -1785,44 +1658,21 @@ async function runAiPipeline(msg, text) {
       markProcessing(uid); // restart the safety timer now that the task has actually started
       const history = await getRecentHistory(uid);
 
-      let quota;
-      try {
-        // Count the history too, since it is sent to the model with every request
-        quota = await reserveQuota(uid, `${CFG.STYLE_PROMPT}\n${history}\n${text}`);
-      } catch (err) {
-        if (err.message === "DAILY_REQUEST_LIMIT") return safeReply(msg, `⚠️ Daily request limit (${CFG.DAILY_REQUEST_LIMIT}) reached. Try again tomorrow.`);
-        if (err.message === "DAILY_TOKEN_LIMIT") return safeReply(msg, `⚠️ Daily token limit (${CFG.DAILY_TOKEN_LIMIT}) reached. Try again tomorrow.`);
-        throw err;
-      }
-      const { user, inputTokens } = quota;
+      // Count the history too, since it is sent to the model with every request
+      const { user, inputTokens } = await reserveQuota(uid, `${CFG.STYLE_PROMPT}\n${history}\n${text}`);
 
       await hydrateUserPrefs(uid);
       const lang = userLanguages.get(cid(uid)) || "en";
 
-      let aiResult;
-      try {
-        aiResult = await withThinkingIndicator(chatId, "🤔 Thinking…", () => getAIReply(uid, text, history, lang));
-      } catch (err) {
-        if (err.message?.startsWith("PRO_LIMIT")) return safeReply(msg, `⚠️ Pro model daily limit reached. Use /setmodel.`);
-        if (err.message === "NO_KEY") return safeReply(msg, "⚠️ Model unavailable. Use /setmodel.");
-        if (err.message?.startsWith("TIMEOUT")) return safeReply(msg, "⚠️ AI took too long to respond. Try again.");
-        throw err;
-      }
-
+      const aiResult = await withThinkingIndicator(chatId, "🤔 Thinking…", () => getAIReply(uid, text, history, lang));
       const { reply, chosen, truncated } = aiResult;
 
       const footer = await finalizeUsage(uid, user, inputTokens, reply, chosen, aiResult.totalTokens);
-
       await appendChatHistory(uid, text, reply, truncated);
-
       await sendAIReply(chatId, "", reply, truncated, footer);
     });
   } catch (err) {
-    if (err.message === "QUEUE_FULL") {
-      return safeReply(msg, "⚠️ Bot is very busy. Please try again shortly.");
-    }
-    console.error("❌ Chat error:", redact(err.message));
-    await safeReply(msg, "❌ Something went wrong. Please try again.");
+    await failureReply(msg, err, "chat");
   } finally {
     unmarkProcessing(uid);
   }
@@ -1870,6 +1720,12 @@ bot.onText(/^\/admin(?:@\w+)?\s*$/, async (msg) => {
     `/banned — list banned users\n` +
     `/ban <i>id</i> <i>reason</i>\n` +
     `/unban <i>id</i>\n\n` +
+    `🧠 <b>Models</b>\n` +
+    `/models — list models &amp; key status\n` +
+    `/addmodel — add or replace a model\n` +
+    `/removemodel <i>id</i>\n` +
+    `/togglemodel <i>id</i> — enable / disable\n` +
+    `/testmodel <i>id</i> — send a test prompt\n\n` +
     `🔐 <b>Access Mode</b>\n` +
     `/private — approved users only\n` +
     `/public — open to everyone\n` +
@@ -2112,6 +1968,129 @@ bot.onText(cmd("private"), async (msg) => {
 bot.onText(cmd("mode"), (msg) => {
   if (msg.chat.id !== CFG.ADMIN_ID) return;
   bot.sendMessage(CFG.ADMIN_ID, PUBLIC_MODE ? "🔓 Mode: PUBLIC" : "🔒 Mode: PRIVATE").catch(() => { });
+});
+
+// ============================================================
+//  ADMIN: MODEL MANAGEMENT (no redeploy needed)
+// ============================================================
+const ADMIN_MODEL_ID = /^[a-z0-9_-]{1,24}$/;
+
+function statusIcon(m) {
+  const s = registry.modelStatus(m);
+  return s === "active" ? "✅" : s === "disabled" ? "⏸" : "🔑";
+}
+
+bot.onText(cmd("models"), async (msg) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  const list = registry.listModels();
+
+  const head = `🧠 <b>Models</b> <i>(${list.length})</i>\n${LINE}\n<i>id · provider · tier · vision · model · label</i>\n\n` +
+    (list.length ? "" : "<i>None yet. Add one with /addmodel.</i>\n\n");
+
+  // Same field order as /addmodel: id · provider · free/pro · vision · model name · label
+  const blocks = list.map((m, i) =>
+    `${statusIcon(m)} ${i + 1}) <code>${escapeHtml(m.id)}</code> ${escapeHtml(m.provider)} ${m.tier} ` +
+    `${m.vision ? "vision" : "no-vision"} <b>${escapeHtml(m.model)}</b> ${escapeHtml(m.label)}`
+  );
+  blocks.push(
+    `\n🔑 <b>Providers</b>\n` +
+    Object.entries(PROVIDERS)
+      .map(([n, pr]) => `${providerKey(n) ? "✅" : "❌"} ${escapeHtml(n)} — <code>${escapeHtml(pr.keyEnv)}</code>`)
+      .join("\n")
+  );
+
+  // Keep every message well under Telegram's 4096 limit, splitting only between blocks
+  const chunks = [];
+  let cur = head;
+  for (const b of blocks) {
+    if (cur.length + b.length > 3500) { chunks.push(cur); cur = ""; }
+    cur += b + "\n\n";
+  }
+  chunks.push(cur);
+  for (const c of chunks) await safeSend(CFG.ADMIN_ID, c.trimEnd(), { parse_mode: "HTML" });
+});
+
+bot.onText(/^\/addmodel(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+
+  const [rawId, rawProvider, rawTier, rawVision, modelName, ...labelParts] =
+    (match[1] || "").trim().split(/\s+/).filter(Boolean);
+  const id = (rawId || "").toLowerCase();
+  const provider = (rawProvider || "").toLowerCase();
+  const tier = (rawTier || "").toLowerCase();
+  const vision = (rawVision || "").toLowerCase();
+
+  if (!ADMIN_MODEL_ID.test(id) || !PROVIDERS[provider] || !["free", "pro"].includes(tier) ||
+    !["yes", "no"].includes(vision) || !modelName) {
+    return bot.sendMessage(CFG.ADMIN_ID,
+      `➕ <b>Add or update a model</b>\n${LINE}\n\n` +
+      `<b>Format</b>\n` +
+      `/addmodel &lt;id&gt; &lt;provider&gt; &lt;free|pro&gt; &lt;vision yes|no&gt; &lt;model-name&gt; [label]\n\n` +
+      `<b>Examples</b>\n` +
+      `/addmodel gem-flash gemini free yes gemini-2.5-flash Gemini Flash\n\n` +
+      `ℹ️ <i>Using an existing id replaces that model.</i>`,
+      { parse_mode: "HTML" }
+    ).catch(() => { });
+  }
+
+  try {
+    const replaced = await registry.addModel({
+      id, provider, tier, vision: vision === "yes", model: modelName,
+      label: labelParts.join(" ").trim().slice(0, 40) || modelName,
+    });
+    bot.sendMessage(CFG.ADMIN_ID,
+      `✅ Model ${id} ${replaced ? "updated" : "added"}.` +
+      (providerKey(provider) ? "" : `\n⚠️ No API key for "${provider}" yet — set ${PROVIDERS[provider].keyEnv} in your environment (users won't see this model until then).`) +
+      `\nTip: /testmodel ${id}`
+    ).catch(() => { });
+  } catch (err) {
+    console.error("addmodel error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not save model.").catch(() => { });
+  }
+});
+
+bot.onText(/^\/removemodel(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  const id = (match[1] || "").trim().toLowerCase();
+  if (!id) return bot.sendMessage(CFG.ADMIN_ID, "⚠️ Usage: /removemodel <id>").catch(() => { });
+  try {
+    const ok = await registry.removeModel(id);
+    bot.sendMessage(CFG.ADMIN_ID, ok ? `🗑 Model ${id} removed.` : `ℹ️ No model with id ${id}.`).catch(() => { });
+  } catch (err) {
+    console.error("removemodel error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not remove model.").catch(() => { });
+  }
+});
+
+bot.onText(/^\/togglemodel(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  const id = (match[1] || "").trim().toLowerCase();
+  const m = registry.getModel(id);
+  if (!m) return bot.sendMessage(CFG.ADMIN_ID, id ? `ℹ️ No model with id ${id}.` : "⚠️ Usage: /togglemodel <id>").catch(() => { });
+  try {
+    await registry.setEnabled(id, !m.enabled);
+    bot.sendMessage(CFG.ADMIN_ID, `${m.enabled ? "⏸ Disabled" : "▶️ Enabled"}: ${id}`).catch(() => { });
+  } catch (err) {
+    console.error("togglemodel error:", err.message);
+    bot.sendMessage(CFG.ADMIN_ID, "⚠️ Could not update model.").catch(() => { });
+  }
+});
+
+bot.onText(/^\/testmodel(?:@\w+)?(?:\s+([\s\S]*))?$/i, async (msg, match) => {
+  if (msg.chat.id !== CFG.ADMIN_ID) return;
+  const id = (match[1] || "").trim().toLowerCase();
+  const m = registry.getModel(id);
+  if (!m) return bot.sendMessage(CFG.ADMIN_ID, id ? `ℹ️ No model with id ${id}.` : "⚠️ Usage: /testmodel <id>").catch(() => { });
+
+  const t0 = Date.now();
+  try {
+    const r = await generate(m, { prompt: "Reply with the single word: OK", maxTokens: 512, timeoutMs: CFG.API_TIMEOUT_MS });
+    bot.sendMessage(CFG.ADMIN_ID, `✅ ${id} works (${Date.now() - t0} ms)\nReply: ${r.reply.trim().slice(0, 100)}`).catch(() => { });
+  } catch (err) {
+    bot.sendMessage(CFG.ADMIN_ID,
+      `❌ ${id} failed: ${err.code || "ERROR"}${err.status ? ` (HTTP ${err.status})` : ""}\n${redact(err.message).slice(0, 300)}`
+    ).catch(() => { });
+  }
 });
 
 startup().catch(err => {
