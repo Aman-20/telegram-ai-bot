@@ -62,13 +62,13 @@ const CFG = {
     "Format with simple Markdown only (**bold**, short bullet lists, code blocks for code); do not use tables.",
 
   DOC_LIMIT: Number(process.env.LIMIT_DOC_ANALYSIS) || 5,
-  IMG_LIMIT: Number(process.env.LIMIT_IMG_ANALYSIS) || 10,
+  IMG_LIMIT: Number(process.env.LIMIT_IMG_ANALYSIS) || 5,
   PRO_LIMIT: Number(process.env.LIMIT_PRO_MODEL) || 10,
   DOC_CHAR_LIMIT: Number(process.env.DOC_CHAR_LIMIT) || 10000,
   MAX_HISTORY_CHARS: Number(process.env.MAX_HISTORY_CHARS) || 500,
   RATE_LIMIT_MS: (Number(process.env.RATE_LIMIT_MS) || 3) * 1000,
   MEDIA_COOLDOWN_MS: (Number(process.env.LIMIT_MEDIA_COOLDOWN) || 10) * 1000,
-  MAX_FILE_MB: Number(process.env.MAX_FILE_MB) || 10,
+  MAX_FILE_MB: Number(process.env.MAX_FILE_MB) || 5,
 
   MAX_CONCURRENT: Number(process.env.MAX_CONCURRENT_REQUESTS) || 20,
   QUEUE_LIMIT: Number(process.env.REQUEST_QUEUE_LIMIT) || 100,
